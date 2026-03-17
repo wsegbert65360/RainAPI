@@ -1,6 +1,6 @@
 import http from 'http';
 import { IncomingMessage, ServerResponse } from 'http';
-import handler from './api/rain';
+import handler from '../api/rain';
 
 const PORT = 3000;
 

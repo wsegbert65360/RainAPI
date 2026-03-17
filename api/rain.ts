@@ -8,7 +8,7 @@ let iemModule: any;
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (!iemModule) {
     iemModule = process.env.MOCK_IEM === 'true'
-      ? await import('../lib/iem.mock')
+      ? await import('../tests/iem.mock')
       : await import('../lib/iem');
   }
   const { fetchIEMData, IEMError } = iemModule;
