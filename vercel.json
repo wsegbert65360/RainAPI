@@ -1,4 +1,5 @@
 {
+  "buildCommand": "",
   "rewrites": [
     { "source": "/rain", "destination": "/api/rain" },
     { "source": "/rainfall", "destination": "/api/rain" }
