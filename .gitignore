@@ -1,0 +1,7 @@
+node_modules
+dist
+.vercel
+*.log
+Rain api.zip
+/tmp/
+.env
