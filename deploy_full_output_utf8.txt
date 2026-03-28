@@ -1,0 +1,38 @@
+﻿npx : Vercel CLI 41.7.8
+At line:1 char:1
++ npx vercel --prod 
+--token vcp_1vOfpfb1jdWD6L
+d573Y1M60lPrO0cgJqIUN129e 
+...
++ ~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo        
+      : NotSpecified: (V  
+  ercel CLI 41.7.8:Stri   
+ ng) [], RemoteExcepti    
+on
+    + FullyQualifiedError 
+   Id : NativeCommandErr  
+  or
+ 
+Retrieving projectΓÇª
+Deploying williams-project
+s-e18a7127/rain-api
+Uploading 
+[--------------------] 
+(0.0B/914B)
+Uploading 
+[====================] 
+(914.0B/914B)
+Inspect: https://vercel.co
+m/williams-projects-e18a71
+27/rain-api/HiH5U1hNGrneBZ
+zh2X2pPRxfLzsj [2s]
+Production: https://rain-3
+kxcybgd2-williams-projects
+-e18a7127.vercel.app [2s]
+Building
+Building
+Completing
+https://rain-3kxcybgd2-williams-projects-e18a7127.vercel.app
