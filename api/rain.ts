@@ -51,14 +51,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(500).json({ error: error.message });
     }
 
-    // Caching: 1 hour for finalized dates, 5 minutes for the current day
-    const todayStr = new Date().toISOString().split('T')[0];
-    const isToday = p_end_date === todayStr;
-    const cacheControl = isToday 
-      ? 's-maxage=300, stale-while-revalidate=60' 
-      : 's-maxage=3600, stale-while-revalidate=600';
-
+    // TEMPORARY: Disable caching to force refresh after backfill
+    const cacheControl = 's-maxage=0, no-cache, no-store, must-revalidate';
     res.setHeader('Cache-Control', cacheControl);
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
 
     // The RPC returns a table, so data is an array of rows.
     // We want total_inches from the first row.

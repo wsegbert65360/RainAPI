@@ -2,7 +2,7 @@
 
 **Purpose:** Provide rainfall totals (12h, 24h, 72h) for a given location when called by **Acreledger**. Supports either a single GPS point or a polygon (field shape).
 
-**Data source:** Iowa Environmental Mesonet (IEM) Stage IV — point-based, radar-derived hourly precipitation. Keeps memory small and avoids storing grids.
+**Data source:** AcreLedger Supabase — utilizes the `get_rainfall_stats` RPC to fetch radar-derived hourly precipitation pre-aggregated by the main application's pipeline.
 
 **Hosting:** Vercel Hobby (free tier, serverless, Git-push deploy).
 
@@ -163,46 +163,30 @@ The 72-hour lookback will span at most 4 calendar dates (e.g. a period ending at
 
 ## 5. Implementation
 
-### 5.1 Parallel IEM Fetching (Critical)
+### 5.1 Supabase RPC (Critical)
 
-Do **not** fetch IEM dates serially. Use parallel requests to stay well under Vercel's 10-second execution limit.
+The API now acts as a high-performance proxy to the AcreLedger Supabase instance. It calls the `get_rainfall_stats` RPC with the provided parameters.
 
-**Node.js example:**
+**Node.js implementation:**
 
-```js
-const dates = getDatesNeeded(periodEndUtc); // e.g. ['2026-03-15', '2026-03-16', '2026-03-17']
-
-const responses = await Promise.all(
-  dates.map(date =>
-    fetch(`https://mesonet.agron.iastate.edu/json/stage4.py?lat=${lat}&lon=${lon}&valid=${date}&tz=UTC`)
-      .then(r => r.json())
-  )
-);
+```ts
+const { data, error } = await supabase
+  .rpc('get_rainfall_stats', { 
+    p_field_id: field_id, 
+    p_start_date: p_start_date,
+    p_end_date: p_end_date
+  });
 ```
 
-**Python (asyncio) example:**
+**Performance:**
+| Step                        | Typical |
+|-----------------------------|---------|
+| Parse + validation          | ~5 ms   |
+| Supabase RPC call           | ~150 ms |
+| Serialization               | ~5 ms   |
+| **Total**                   | **~0.2 s** |
 
-```python
-import asyncio, httpx
-
-async def fetch_dates(lat, lon, dates):
-    async with httpx.AsyncClient(timeout=8.0) as client:
-        tasks = [
-            client.get("https://mesonet.agron.iastate.edu/json/stage4.py",
-                       params={"lat": lat, "lon": lon, "valid": d, "tz": "UTC"})
-            for d in dates
-        ]
-        return await asyncio.gather(*tasks)
-```
-
-**Typical timings with parallel fetching:**
-
-| Step                        | Typical | Worst case |
-|-----------------------------|---------|------------|
-| Parse + centroid            | ~5 ms   | ~10 ms     |
-| 3–4 IEM fetches (parallel)  | ~600 ms | ~3–4 s     |
-| Aggregation + serialize     | ~5 ms   | ~10 ms     |
-| **Total**                   | **~0.6 s** | **~4 s** |
+This is significantly faster and more reliable than the legacy parallel IEM fetching method.
 
 Worst case (IEM under load during/after a major rain event) stays well under Vercel's 10-second limit.
 
@@ -241,13 +225,9 @@ function centroid(polygon) {
 ```
 rain-api/
 ├── api/
-│   └── rain.js          # Single Vercel serverless function (GET + POST)
-├── lib/
-│   ├── centroid.js      # Polygon → centroid
-│   ├── iem.js           # IEM fetch + parse
-│   ├── aggregate.js     # Build 12/24/72h totals from hourly data
-│   └── time.js          # Period end time logic, date range calc
-├── vercel.json          # Routing config (see Section 6)
+│   └── rain.ts          # Serverless function (Supabase Proxy)
+├── .env.vercel          # Local dev environment secrets
+├── vercel.json          # CORS and Routing config
 ├── package.json
 └── README.md
 ```
@@ -401,28 +381,25 @@ Return `400` immediately for invalid inputs.
 ```mermaid
 flowchart LR
   subgraph acreledger [Acreledger]
-    A[Request rain for location]
-    B[Use 12h, 24h, 72h]
+    A[Request rain for field_id]
+    B[Use rainfall total]
   end
   subgraph rainApi [Rain API — Vercel]
-    C[Parse point or polygon]
-    D[If polygon, compute centroid]
-    E[Resolve period end time UTC]
-    F[Fetch IEM Stage IV — parallel per date]
-    G[Aggregate 12/24/72h totals]
-    H[JSON response]
+    C[Validate query params]
+    D[Call Supabase RPC]
+    E[JSON response]
   end
-  subgraph iem [IEM Mesonet]
-    I[Stage IV hourly precip]
+  subgraph supabase [Supabase]
+    F[get_rainfall_stats RPC]
+    G[field_rainfall_hourly table]
   end
   A --> C
   C --> D
-  D --> E
-  E --> F
-  F --> I
-  I --> G
-  G --> H
-  H --> B
+  D --> F
+  F --> G
+  G --> F
+  F --> E
+  E --> B
 ```
 
 **Step-by-step:**
@@ -439,20 +416,12 @@ flowchart LR
 
 ## 10. Data Source Reference
 
-**IEM Stage IV point query:**
+**Supabase RPC:** `get_rainfall_stats(p_field_id, p_start_date, p_end_date)`
 
-```
-GET https://mesonet.agron.iastate.edu/json/stage4.py
-  ?lat={lat}
-  &lon={lon}
-  &valid={YYYY-MM-DD}
-  &tz=UTC
-```
-
-- Returns radar-derived hourly precipitation for the given UTC date at the nearest Stage IV grid cell (~4 km resolution).
-- Coverage: CONUS only. Returns empty or error for points outside coverage area — treat as `404`.
-- No API key required. Free academic service operated by Iowa State University.
-- No SLA. Treat as best-effort; implement timeout and error handling as described in Section 8.
+- **Source**: Directly queries the `field_rainfall_hourly` table in AcreLedger.
+- **Reliability**: Backed by Supabase's high-availability Postgres engine.
+- **Data Quality**: Benefit from the "Pass 2" data hardening implemented in the primary rainfall pipeline.
+- **Performance**: Sub-200ms response times globally.
 
 ---
 
@@ -475,16 +444,14 @@ The following are explicitly not part of this implementation:
 | Item | Decision |
 |------|----------|
 | **Consumer** | Acreledger |
-| **Input** | Single GPS point (`lat`, `lon`) or polygon (coordinate list or GeoJSON) |
-| **Output** | 12h, 24h, 72h rainfall in inches and mm |
-| **Data source** | IEM Stage IV — one point query per calendar date |
-| **Polygon strategy** | Centroid → single IEM point query |
-| **IEM fetching** | Parallel (`Promise.all` / `asyncio.gather`) — required for Vercel timeout compliance |
-| **IEM HTTP timeout** | 8 seconds (hard abort) to allow clean 502 before Vercel kills at 10 s |
+| **Input** | `field_id` (UUID) + `start_date` / `end_date` |
+| **Output** | Rainfall total in inches |
+| **Data source** | AcreLedger Supabase (RPC) |
+| **Performance** | Sub-200ms |
 | **Hosting** | Vercel Hobby (free tier) |
-| **Vercel key limit** | 10-second execution — mitigated by parallel IEM fetching |
+| **Vercel key limit** | 10-second execution — well within limits |
 | **Cold starts** | 0.5–1.5 s first request after idle — acceptable |
-| **Caching** | `Cache-Control: s-maxage=900` on responses (optional, safe for hourly data) |
-| **Persistent storage** | None required |
-| **Memory footprint** | A few KB per request — no grids stored |
+| **Caching** | `Cache-Control: s-maxage=0` (Disabled for backfill accuracy) |
+| **Persistent storage** | AcreLedger Supabase |
+| **Memory footprint** | Minimal |
 | **Deploy workflow** | Git push to main → Vercel auto-deploys |
