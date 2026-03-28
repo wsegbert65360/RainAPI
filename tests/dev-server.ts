@@ -1,4 +1,5 @@
 import http from 'http';
+import 'dotenv/config';
 import { IncomingMessage, ServerResponse } from 'http';
 import handler from '../api/rain';
 
