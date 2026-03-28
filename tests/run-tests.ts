@@ -1,50 +1,68 @@
 import axios from 'axios';
 import 'dotenv/config';
 
-const BASE_URL = 'http://localhost:3000';
+const BASE = 'http://localhost:3000';
+const LAT = 38.4626783;
+const LON = -93.5373719;
 
-async function runTests() {
-  console.log('--- Rain API Test Suite (Supabase Refactor) ---');
+async function run() {
+  console.log('=== Rain API - Lat/Lon Mode Test ===');
+  console.log(`Target: lat=${LAT}, lon=${LON}\n`);
 
   const tests = [
-    { 
-      name: 'TEST A - Field Rainfall (Past Date)', 
-      url: '/rain?field_id=550e8400-e29b-41d4-a716-446655440000&date=2026-03-20' 
+    {
+      name: 'TEST 1 - Last 7 days (default)',
+      url: `/rain?lat=${LAT}&lon=${LON}`,
     },
-    { 
-      name: 'TEST B - Field Rainfall (Today)', 
-      url: `/rain?field_id=550e8400-e29b-41d4-a716-446655440000&date=${new Date().toISOString().split('T')[0]}` 
+    {
+      name: 'TEST 2 - Explicit days=7',
+      url: `/rain?lat=${LAT}&lon=${LON}&days=7`,
     },
-    { 
-      name: 'TEST C - Missing field_id', 
-      url: '/rain?date=2026-03-27', 
-      expectedStatus: 400 
+    {
+      name: 'TEST 3 - Single date (2026-03-27, expected 0.22")',
+      url: `/rain?lat=${LAT}&lon=${LON}&date=2026-03-27`,
     },
-    { 
-      name: 'TEST D - Missing date', 
-      url: '/rain?field_id=550e8400-e29b-41d4-a716-446655440000', 
-      expectedStatus: 400 
+    {
+      name: 'TEST 4 - Date range start/end',
+      url: `/rain?lat=${LAT}&lon=${LON}&start_date=2026-03-22&end_date=2026-03-28`,
+    },
+    {
+      name: 'TEST 5 - Bad lat (400 expected)',
+      url: `/rain?lat=999&lon=${LON}`,
+      expectStatus: 400,
+    },
+    {
+      name: 'TEST 6 - No params (400 expected)',
+      url: `/rain`,
+      expectStatus: 400,
     },
   ];
 
   for (const t of tests) {
     try {
-      const res = await axios.get(`${BASE_URL}${t.url}`, { validateStatus: () => true });
-      const statusMatch = res.status === (t.expectedStatus || 200);
-      console.log(`${t.name}: status ${res.status} ${statusMatch ? '✅' : '❌'}`);
-      
+      const res = await axios.get(`${BASE}${t.url}`, { validateStatus: () => true });
+      const ok = res.status === (t.expectStatus || 200);
+      console.log(`${ok ? '✅' : '❌'} ${t.name}`);
+      console.log(`   Status: ${res.status}`);
       if (res.status === 200) {
-          console.log(`  Rainfall: ${res.data.rainfall} total_in`);
-          console.log(`  Cache-Control: ${res.headers['cache-control']}`);
+        const d = res.data;
+        console.log(`   Rainfall: ${d.rainfall}" over ${d.period?.days} day(s)`);
+        if (d.breakdown) {
+          const rainyDays = Object.entries(d.breakdown)
+            .filter(([, v]) => (v as number) > 0)
+            .map(([k, v]) => `${k}:${v}"`);
+          console.log(`   Days with rain: ${rainyDays.length > 0 ? rainyDays.join(', ') : 'none'}`);
+        }
       } else {
-          console.log(`  Error: ${res.data.error} - ${res.data.detail}`);
+        console.log(`   Response: ${JSON.stringify(res.data)}`);
       }
-    } catch (err: any) {
-      console.log(`${t.name}: FAILED - ${err.message} ❌`);
+    } catch (e: any) {
+      console.log(`❌ ${t.name}: FAILED - ${e.message}`);
     }
+    console.log();
   }
 
-  console.log('\n--- Test Suite Complete ---');
+  console.log('=== Done ===');
 }
 
-runTests();
+run();
