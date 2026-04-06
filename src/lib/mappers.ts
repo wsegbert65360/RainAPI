@@ -33,19 +33,6 @@ function toCamelCase(row: Record<string, any>): Record<string, any> {
   return result;
 }
 
-/**
- * Convert a camelCase TypeScript object to a snake_case database row.
- * Only includes keys present in the source object (partial updates supported).
- */
-function toSnakeCase(obj: Record<string, any>): Record<string, any> {
-  const result: Record<string, any> = {};
-  for (const [key, value] of Object.entries(obj)) {
-    const snakeKey = key.replace(/[A-Z]/g, letter => `_${letter.toLowerCase()}`);
-    result[snakeKey] = value;
-  }
-  return result;
-}
-
 // =============================================================================
 // SavedSeed Mappers
 // =============================================================================
