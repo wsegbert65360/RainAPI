@@ -97,10 +97,10 @@ export interface Field {
   acreage: number | null;
   /** GeoJSON polygon boundary (lon/lat coordinate ring) */
   boundary: object | null;
-  /** Computed centroid latitude */
-  centroidLat: number | null;
-  /** Computed centroid longitude */
-  centroidLon: number | null;
+  /** Latitude (decimal degrees) */
+  latitude: number | null;
+  /** Longitude (decimal degrees) */
+  longitude: number | null;
   /** Crop currently planted (if any) */
   currentCrop: string | null;
   /** ISO 8601 timestamp of record creation */
@@ -129,20 +129,22 @@ export interface Farm {
 
 // -----------------------------------------------------------------------------
 // RainfallRecord — Hourly rainfall data point for a field
-// Stored in Supabase `field_rainfall_hourly` table, accessed via
-// the `get_rainfall_stats` RPC. NOT fetched from any external Vercel API.
+// Stored in Supabase `field_rainfall_hourly` table.
+// Data originates from MRMS MultiSensor QPE Pass 2 (NOAA) via the
+// backfill pipeline (backfill_rain.ts). Also accessible via the
+// `get_rainfall_stats` RPC for aggregated queries.
 // -----------------------------------------------------------------------------
 export interface RainfallRecord {
   /** UUID of the field this reading belongs to */
   fieldId: string;
-  /** ISO 8601 date string (YYYY-MM-DD) */
-  date: string;
-  /** ISO 8601 hour string (HH:00) */
-  hour: string;
+  /** ISO 8601 UTC timestamp of the reading (e.g. "2026-03-21T14:00:00Z") */
+  timestampUtc: string;
   /** Precipitation amount in inches */
-  precipInches: number;
-  /** Whether this reading has been validated ("Pass 2" hardened) */
-  isValidated: boolean;
+  rainfallIn: number;
+  /** Data source label (e.g. "Pass 2") */
+  source: string;
+  /** Whether this reading is finalized (backfill complete) */
+  finalized: boolean;
 }
 
 // -----------------------------------------------------------------------------

@@ -165,8 +165,8 @@ export function mapDbToField(row: Record<string, any>): Field {
     name: String(camel.name ?? ''),
     acreage: coerceNumeric(camel.acreage),
     boundary: camel.boundary ?? null,
-    centroidLat: coerceNumeric(camel.centroidLat),
-    centroidLon: coerceNumeric(camel.centroidLon),
+    latitude: coerceNumeric(camel.latitude),
+    longitude: coerceNumeric(camel.longitude),
     currentCrop: camel.currentCrop != null ? String(camel.currentCrop) : null,
     createdAt: String(camel.createdAt ?? ''),
     updatedAt: String(camel.updatedAt ?? ''),
@@ -182,8 +182,8 @@ export function mapFieldToDb(field: Partial<Field>): Record<string, any> {
   if (field.name !== undefined) clean.name = field.name;
   if (field.acreage !== undefined) clean.acreage = field.acreage;
   if (field.boundary !== undefined) clean.boundary = field.boundary;
-  if (field.centroidLat !== undefined) clean.centroid_lat = field.centroidLat;
-  if (field.centroidLon !== undefined) clean.centroid_lon = field.centroidLon;
+  if (field.latitude !== undefined) clean.latitude = field.latitude;
+  if (field.longitude !== undefined) clean.longitude = field.longitude;
   if (field.currentCrop !== undefined) clean.current_crop = field.currentCrop;
   return clean;
 }
@@ -229,10 +229,10 @@ export function mapDbToRainfallRecord(row: Record<string, any>): RainfallRecord 
   const camel = toCamelCase(row);
   return {
     fieldId: String(camel.fieldId ?? ''),
-    date: String(camel.date ?? ''),
-    hour: String(camel.hour ?? ''),
-    precipInches: Number(camel.precipInches ?? 0),
-    isValidated: Boolean(camel.isValidated ?? false),
+    timestampUtc: String(camel.timestampUtc ?? ''),
+    rainfallIn: coerceNumeric(camel.rainfallIn) ?? 0,
+    source: camel.source != null ? String(camel.source) : '',
+    finalized: Boolean(camel.finalized ?? false),
   };
 }
 

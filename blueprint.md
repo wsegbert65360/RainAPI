@@ -39,8 +39,8 @@ All interfaces live in `src/types/farm.ts`. Every field below MUST exist in the 
 | `name` | `string` | `name` |
 | `acreage` | `number \| null` | `acreage` |
 | `boundary` | `object \| null` | `boundary` |
-| `centroidLat` | `number \| null` | `centroid_lat` |
-| `centroidLon` | `number \| null` | `centroid_lon` |
+| `latitude` | `number \| null` | `latitude` |
+| `longitude` | `number \| null` | `longitude` |
 | `currentCrop` | `string \| null` | `current_crop` |
 | `createdAt` | `string` | `created_at` |
 | `updatedAt` | `string` | `updated_at` |
@@ -104,15 +104,15 @@ All interfaces live in `src/types/farm.ts`. Every field below MUST exist in the 
 
 ### 1.6 RainfallRecord
 
-Stored in `field_rainfall_hourly` table, accessed via `get_rainfall_stats` RPC. NOT fetched from any external API.
+Stored in `field_rainfall_hourly` table. Data ingested from NOAA MRMS MultiSensor QPE Pass 2 via `backfill_rain.ts`. Unique constraint: `(field_id, timestamp_utc)`.
 
 | Field | Type | DB Column |
 |-------|------|-----------|
 | `fieldId` | `string` (UUID) | `field_id` |
-| `date` | `string` | `date` |
-| `hour` | `string` | `hour` |
-| `precipInches` | `number` | `precip_inches` |
-| `isValidated` | `boolean` | `is_validated` |
+| `timestampUtc` | `string` (ISO 8601) | `timestamp_utc` |
+| `rainfallIn` | `number` | `rainfall_in` |
+| `source` | `string` | `source` |
+| `finalized` | `boolean` | `finalized` |
 
 ### 1.7 RainfallStats
 
@@ -169,27 +169,33 @@ All mapping in `src/lib/mappers.ts`.
 
 ---
 
-## 3. Rainfall — Data Persistence
+## 3. Rainfall — Data Sources & Persistence
 
-Rainfall is stored in Supabase `field_rainfall_hourly` and accessed via the `get_rainfall_stats` RPC. The `RainService` (`src/services/RainService.ts`) calls Supabase directly — no external Vercel API is involved.
+Rainfall data flows into Supabase from **NOAA MRMS MultiSensor QPE Pass 2** via the backfill pipeline (`backfill_rain.ts`). The Vercel API (`api/rain.ts`) also provides direct IEM Stage IV coordinate queries.
 
-**RPC call:**
+**Ingestion pipeline:**
 
-```typescript
-const { data, error } = await supabase.rpc('get_rainfall_stats', {
-  p_field_id: fieldId,
-  p_start_date: startDate,
-  p_end_date: endDate,
-});
+```
+NOAA MRMS (GRIB2) → backfill_rain.ts (parse + convert) → field_rainfall_hourly table → get_rainfall_stats RPC
+IEM Stage IV      → api/rain.ts (direct query by lat/lon, no DB write)
 ```
 
-**RainService methods:**
+**MRMS data sources (backfill):**
+- Archive: `https://mtarchive.geol.iastate.edu/.../MultiSensor_QPE_01H_Pass2/`
+- Live: `https://mrms.ncep.noaa.gov/2D/MultiSensor_QPE_01H_Pass2/`
+- Format: GRIB2 → gunzip → binary decode → PNG pixel extraction → inches (mm × 0.0393701)
 
-| Method | Description |
-|--------|-------------|
-| `getRainfallStats(params)` | Aggregated stats via RPC |
-| `getRainfallHistory(params)` | Hourly records from `field_rainfall_hourly` |
-| `getRecentRainfall(fieldId, days)` | Last N days (default: 7) |
+**IEM Stage IV (Vercel API coordinate mode):**
+- Endpoint: `https://mesonet.agron.iastate.edu/json/stage4.py`
+- Coverage: CONUS only, ~1-2 hour lag
+- No DB write — direct HTTP response
+
+**Supabase RPCs:**
+
+| RPC | Parameters | Description |
+|-----|-----------|-------------|
+| `get_rainfall_stats` | `p_field_id, p_start_date, p_end_date` | Aggregated stats for a field |
+| `rollup_all_farms_daily` | `p_date` | Daily rollup across all farms |
 
 ---
 

@@ -1,9 +1,14 @@
 // =============================================================================
 // AcreLedger — Rainfall Service
 // =============================================================================
-// Fetches rainfall data DIRECTLY from AcreLedger Supabase via the
-// `get_rainfall_stats` RPC. Supabase is the sole authoritative source.
-// No external API endpoints are called.
+// Fetches rainfall data from AcreLedger Supabase. Two data paths:
+//
+//   1. Aggregated stats via `get_rainfall_stats` RPC (recommended for UI display)
+//   2. Raw hourly records from `field_rainfall_hourly` table
+//
+// Rainfall data originates from NOAA MRMS MultiSensor QPE Pass 2 (GRIB2 files)
+// ingested via the backfill pipeline (backfill_rain.ts). The Vercel API
+// (api/rain.ts) also supports direct IEM Stage IV coordinate queries.
 // =============================================================================
 
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
@@ -115,12 +120,11 @@ export async function getRainfallHistory(
 
   const { data, error } = await client
     .from('field_rainfall_hourly')
-    .select('*')
+    .select('field_id, timestamp_utc, rainfall_in, source, finalized')
     .eq('field_id', fieldId)
-    .gte('date', startDate)
-    .lte('date', endDate)
-    .order('date', { ascending: true })
-    .order('hour', { ascending: true })
+    .gte('timestamp_utc', `${startDate}T00:00:00Z`)
+    .lte('timestamp_utc', `${endDate}T23:59:59Z`)
+    .order('timestamp_utc', { ascending: true })
     .limit(limit);
 
   if (error) {
