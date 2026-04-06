@@ -1,9 +1,23 @@
-node_modules
-dist
-.vercel
-*.log
-Rain api.zip
-/tmp/
-.env
+# Dependencies
+node_modules/
 
-.vercel
+# Build output
+dist/
+.vercel/
+
+# Environment files (CRITICAL)
+.env*
+!.env.example
+
+# Logs and build artifacts
+*.log
+deploy_*.txt
+
+# Temp and OS files
+/tmp/
+.DS_Store
+Thumbs.db
+
+# Archives
+*.zip
+*.tar.gz
