@@ -18,8 +18,15 @@
     "typescript": "^5.8.2"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.100.1",
-    "axios": "^1.13.6",
+    "@supabase/supabase-js": "^2.101.1",
+    "axios": "^1.14.0",
     "dotenv": "^17.3.1"
+  },
+  "overrides": {
+    "ajv": "^8.18.0",
+    "minimatch": "^10.2.5",
+    "path-to-regexp": "^8.4.2",
+    "smol-toml": "^1.6.1",
+    "undici": "^6.24.1"
   }
 }
