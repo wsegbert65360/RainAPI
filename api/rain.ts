@@ -59,11 +59,23 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     // 3. Time Logic
     const tz = (req.query.tz as string) || 'UTC';
     const asOf = (req.query.asOf as string);
+    const startDate = (req.query.start_date as string);
     const { keys, periodEndUtc } = generateHourKeys(asOf, tz, 169);
-    
+    const endDate = (req.query.end_date as string) || periodEndUtc.toISOString().split('T')[0];
+
+    if (startDate && !/^\d{4}-\d{2}-\d{2}$/.test(startDate)) {
+      return res.status(400).json({ error: 'Invalid start_date', detail: 'Expected YYYY-MM-DD format' });
+    }
+    if (endDate && !/^\d{4}-\d{2}-\d{2}$/.test(endDate)) {
+      return res.status(400).json({ error: 'Invalid end_date', detail: 'Expected YYYY-MM-DD format' });
+    }
+    if (startDate && !fieldId) {
+      return res.status(400).json({ error: 'start_date requires field_id', detail: 'Custom date ranges are only available with field_id queries' });
+    }
+
     // 4. Mode A: IEM Radar Data (Hourly High-Resolution)
     let iemTotals = null;
-    if (lat && lon) {
+    if (lat && lon && !startDate) {
       const dates = getRequiredDates(keys);
       const hourMap = await fetchIemMultipleDays(lat, lon, dates);
       iemTotals = aggregateRain(hourMap, keys);
@@ -82,24 +94,42 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         });
       }
 
-      const today = new Date().toISOString().split('T')[0];
-      const date24h = new Date(Date.now() - 1 * 86400000).toISOString().split('T')[0];
-      const date72h = new Date(Date.now() - 3 * 86400000).toISOString().split('T')[0];
-      const date168h = new Date(Date.now() - 7 * 86400000).toISOString().split('T')[0];
+      const date24h = new Date(periodEndUtc.getTime() - 1 * 86400000).toISOString().split('T')[0];
+      const date72h = new Date(periodEndUtc.getTime() - 3 * 86400000).toISOString().split('T')[0];
+      const date168h = new Date(periodEndUtc.getTime() - 7 * 86400000).toISOString().split('T')[0];
       
-      const fetchDb = async (start: string) => {
+      const fetchDb = async (start: string, end: string) => {
         const { data, error } = await supabase.rpc('get_rainfall_stats' as any, {
           p_field_id: fieldId,
           p_start_date: start,
-          p_end_date: today
+          p_end_date: end
         });
-        return error ? 0 : Number((data as any)?.rainfall || 0);
+        if (error) return 0;
+        const row = Array.isArray(data) ? data[0] : data;
+        return Number(row?.total_inches || 0);
       };
 
+      // 5b. Custom range mode: if start_date provided, skip windowed fetches and return single total
+      if (startDate) {
+        const customTotal = await fetchDb(startDate, endDate);
+        res.setHeader('Cache-Control', 's-maxage=900, stale-while-revalidate=300');
+        return res.status(200).json({
+          location: {
+            type,
+            ...(type === 'polygon' ? { centroidLat: lat, centroidLon: lon } : { lat, lon }),
+            fieldId
+          },
+          periodEndUtc: periodEndUtc.toISOString(),
+          units: 'in',
+          rain: { total: Number(customTotal.toFixed(3)) },
+          rainMm: { total: Number((customTotal * 25.4).toFixed(2)) }
+        });
+      }
+
       const [sum24, sum72, sum168] = await Promise.all([
-        fetchDb(date24h),
-        fetchDb(date72h),
-        fetchDb(date168h)
+        fetchDb(date24h, endDate),
+        fetchDb(date72h, endDate),
+        fetchDb(date168h, endDate)
       ]);
 
       dbTotals = { '24h': sum24, '72h': sum72, '168h': sum168 };
@@ -144,8 +174,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   } catch (err: any) {
     console.error('Rain API Error:', err);
     return res.status(500).json({
-      error: 'Internal Server Error',
-      detail: err.message
+      error: 'Internal Server Error'
     });
   }
 }
