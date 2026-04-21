@@ -4,12 +4,15 @@ This document provides all the technical details necessary for an AI coding agen
 
 ## Overview
 
-The Rain API is a Vercel serverless function that provides rainfall totals for a given location or field. It supports **two independent query modes**:
+The Rain API is a Vercel serverless function that provides rainfall totals (12h, 24h, 72h, 168h windows) for a given location or field. It supports **three independent query modes**:
 
-| Mode | Input | Data Source |
-|------|-------|-------------|
-| **Coordinate mode** | `lat` + `lon` | IEM Stage IV radar (direct, always current) |
-| **Field ID mode** | `field_id` | AcreLedger Supabase RPC (`get_rainfall_stats`) |
+| Mode | Method | Input | Data Source |
+|------|--------|-------|-------------|
+| **Coordinate lookup** | `GET` | `lat` + `lon` | IEM Stage IV radar (direct, always current) |
+| **Polygon lookup** | `POST` | `polygon` body | IEM Stage IV radar (centroid computed, then queried) |
+| **Field ID lookup** | `GET` or `POST` | `field_id` | AcreLedger Supabase RPC `get_rainfall_stats` |
+
+When both coordinate and `field_id` inputs are provided, results are merged (MAX of both sources).
 
 > **Recommended for new integrations:** Use **coordinate mode** (`lat`/`lon`). It queries IEM Stage IV directly and is not dependent on the Supabase ingestion pipeline being up to date.
 
@@ -33,9 +36,9 @@ Available at `/api/rain`, `/rain`, and `/rainfall` (all route to the same handle
 
 ---
 
-### Mode A: Coordinate Lookup (Recommended)
+### Mode A: Coordinate Lookup (GET)
 
-Fetch rainfall for a GPS coordinate over a date window. Queries IEM Stage IV directly.
+Fetch rainfall for a GPS coordinate. Queries IEM Stage IV directly.
 
 **Endpoint:** `GET /rain`
 
@@ -45,119 +48,130 @@ Fetch rainfall for a GPS coordinate over a date window. Queries IEM Stage IV dir
 | :--- | :--- | :--- | :--- |
 | `lat` | number | **Yes** | Latitude in decimal degrees (-90 to 90) |
 | `lon` | number | **Yes** | Longitude in decimal degrees (-180 to 180) |
-| `days` | integer | No | Number of past days to sum (default: `7`, max: `30`) |
-| `date` | string | No | Single date `YYYY-MM-DD` — overrides `days` |
-| `start_date` | string | No | Start of explicit date range `YYYY-MM-DD` |
-| `end_date` | string | No | End of explicit date range `YYYY-MM-DD` (use with `start_date`) |
-
-**Date resolution priority:** `start_date`+`end_date` → `date` → `days` (default 7).
+| `tz` | string | No | IANA timezone (e.g. `America/Chicago`). Affects how lookback windows are calculated. Default: `UTC`. |
+| `asOf` | string | No | ISO 8601 timestamp to treat as "now". Otherwise uses current time. |
+| `field_id` | string (UUID) | No | AcreLedger field UUID. When provided, Supabase data is merged with IEM (MAX of both). |
 
 **Examples:**
 
 ```http
-GET /rain?lat=38.4626783&lon=-93.5373719
-GET /rain?lat=38.4626783&lon=-93.5373719&days=7
-GET /rain?lat=38.4626783&lon=-93.5373719&date=2026-03-27
-GET /rain?lat=38.4626783&lon=-93.5373719&start_date=2026-03-01&end_date=2026-03-28
-```
-
-**Success Response (200):**
-
-```json
-{
-  "mode": "iem",
-  "location": { "lat": 38.4626783, "lon": -93.5373719 },
-  "period": { "start": "2026-03-22", "end": "2026-03-28", "days": 7 },
-  "rainfall": 0.22,
-  "breakdown": {
-    "2026-03-22": 0,
-    "2026-03-23": 0,
-    "2026-03-24": 0,
-    "2026-03-25": 0,
-    "2026-03-26": 0,
-    "2026-03-27": 0.22,
-    "2026-03-28": 0
-  },
-  "units": "inches",
-  "source": "IEM Stage IV"
-}
+GET /rain?lat=38.5319&lon=-93.5331
+GET /rain?lat=38.5319&lon=-93.5331&tz=America/Chicago
+GET /rain?lat=38.5319&lon=-93.5331&asOf=2026-04-17T06:00:00Z
 ```
 
 ---
 
-### Mode B: Field ID Lookup (AcreLedger / Supabase)
+### Mode B: Polygon Lookup (POST)
 
-Fetch rainfall for a specific AcreLedger field from the Supabase database.
+Fetch rainfall for a field boundary. Computes the centroid and queries IEM Stage IV at that point.
 
-**Endpoint:** `GET /rain`
+**Endpoint:** `POST /rain`
+
+**Content-Type:** `application/json`
+
+**Body — coordinate array:**
+
+```json
+{
+  "polygon": [[-93.65, 42.02], [-93.60, 42.02], [-93.60, 42.05], [-93.65, 42.05], [-93.65, 42.02]]
+}
+```
+
+**Body — GeoJSON polygon:**
+
+```json
+{
+  "type": "Polygon",
+  "coordinates": [[[-93.65, 42.02], [-93.60, 42.02], [-93.60, 42.05], [-93.65, 42.05], [-93.65, 42.02]]]
+}
+```
+
+**Query parameters** (`tz`, `asOf`, `field_id`) can also be passed on POST requests.
+
+---
+
+### Mode C: Field ID Lookup (Supabase)
+
+Fetch rainfall for a specific AcreLedger field. Must be combined with `lat`/`lon` for IEM data, or used alone (returns zeros if no coordinates are provided).
 
 **Query Parameters:**
 
 | Parameter | Type | Required | Description |
 | :--- | :--- | :--- | :--- |
-| `field_id` | UUID | **Yes** | The AcreLedger field UUID |
-| `date` | string | Yes* | Single date `YYYY-MM-DD` |
-| `start_date` | string | Yes* | Start date for a range query |
-| `end_date` | string | No | End date for range (defaults to `start_date`) |
-
-*Either `date` or `start_date` is required.
-
-**Example:**
-
-```http
-GET /rain?field_id=2284c948-212e-4ffb-8bf9-4c11fd08edd7&start_date=2026-03-21&end_date=2026-03-28
-```
-
-**Success Response (200):**
-
-```json
-{
-  "rainfall": 0.22
-}
-```
-
-> **Note:** Returns `{ "rainfall": 0 }` if the field has no data in the database for the requested window. This is not an error — it may indicate the ingestion pipeline has a gap. Use coordinate mode to cross-check.
+| `field_id` | string (UUID) | **Yes** | The AcreLedger field UUID |
 
 ---
 
-## Response Schema Reference
+## Response Schema
 
-| Field | Mode | Description |
+**Success (200):**
+
+```json
+{
+  "location": {
+    "type": "point",
+    "lat": 38.5319,
+    "lon": -93.5331,
+    "fieldId": null
+  },
+  "periodEndUtc": "2026-04-20T12:00:00.000Z",
+  "units": "in",
+  "rain": {
+    "12h": 0.00,
+    "24h": 0.00,
+    "72h": 2.32,
+    "168h": 3.84
+  },
+  "rainMm": {
+    "12h": 0.00,
+    "24h": 0.00,
+    "72h": 58.93,
+    "168h": 97.54
+  }
+}
+```
+
+For polygon requests, `location` uses `centroidLat`/`centroidLon` instead of `lat`/`lon`:
+
+```json
+{
+  "location": {
+    "type": "polygon",
+    "centroidLat": 42.035,
+    "centroidLon": -93.625,
+    "fieldId": null
+  }
+}
+```
+
+**Optional `dataWarning` field** (string) — present when more than 10% of hourly data is missing in a window, or when Supabase data was merged and added rain beyond what IEM reported.
+
+| Field | Type | Description |
 |-------|------|-------------|
-| `mode` | A only | Always `"iem"` for coordinate mode |
-| `location` | A only | `{ lat, lon }` echo of input coords |
-| `period` | A only | `{ start, end, days }` of the query window |
-| `rainfall` | Both | Total inches over the query window (rounded to 3 decimal places) |
-| `breakdown` | A only | Per-day inches dictionary (`YYYY-MM-DD` keys) |
-| `units` | A only | Always `"inches"` |
-| `source` | A only | Always `"IEM Stage IV"` |
+| `location.type` | string | `"point"` or `"polygon"` |
+| `location.lat` / `location.lon` | number | Point coordinates (omitted for polygon) |
+| `location.centroidLat` / `location.centroidLon` | number | Polygon centroid (omitted for point) |
+| `location.fieldId` | string or null | Field UUID if provided |
+| `periodEndUtc` | string | ISO 8601 timestamp of the period end (last complete UTC hour) |
+| `units` | string | Always `"in"` |
+| `rain.12h` | number | 12-hour accumulation in inches |
+| `rain.24h` | number | 24-hour accumulation in inches |
+| `rain.72h` | number | 72-hour accumulation in inches |
+| `rain.168h` | number | 7-day (168-hour) accumulation in inches |
+| `rainMm.*` | number | Same windows in millimeters |
 
 ---
 
 ## Error Responses
 
-| Code | Condition |
-|------|-----------|
-| `400` | Missing required params, invalid lat/lon range, or missing `field_id`+`date` |
-| `500` | Supabase RPC error (field ID mode) or unexpected server failure |
+| Code | Condition | Body |
+|------|-----------|------|
+| `400` | Missing `lat`/`lon` (and no polygon body) | `{ "error": "Internal Server Error", "detail": "..." }` |
+| `500` | Supabase not configured (field ID mode without env vars) | `{ "error": "Supabase not configured", "detail": "SUPABASE_URL environment variable is not set..." }` |
+| `500` | Any unhandled error | `{ "error": "Internal Server Error", "detail": "<error message>" }` |
 
-**400 example (no params):**
-```json
-{
-  "error": "Missing required parameters",
-  "detail": "Provide lat & lon for coordinate-based lookup, or field_id for database lookup.",
-  "examples": [
-    "/rain?lat=38.4626783&lon=-93.5373719",
-    "/rain?lat=38.4626783&lon=-93.5373719&days=7",
-    "/rain?field_id=<uuid>&date=2026-03-27"
-  ]
-}
-```
-
-**400 example (invalid lat):**
-```json
-{ "error": "Invalid lat value. Must be -90 to 90." }
-```
+> **Note:** The current handler does not return explicit 400 or 404 status codes for invalid inputs or non-CONUS locations. Invalid coordinates result in `rain` values of `0`. Field ID mode without Supabase env vars returns a 500.
 
 ---
 
@@ -167,28 +181,30 @@ GET /rain?field_id=2284c948-212e-4ffb-8bf9-4c11fd08edd7&start_date=2026-03-21&en
 CORS headers (`Access-Control-Allow-Origin: *`) are set on all responses — safe to call directly from a browser with `fetch` or `axios`. No API key required.
 
 ### 2. Caching Strategy
-- **Coordinate mode (IEM):** `Cache-Control: s-maxage=300, stale-while-revalidate=60` — cached 5 minutes at the CDN edge.
-- **Field ID mode (Supabase):** `Cache-Control: no-store` — caching disabled to ensure backfill data is always fresh.
+All responses use `Cache-Control: s-maxage=900, stale-while-revalidate=300` — cached 15 minutes at the CDN edge with 5 minutes of stale-while-revalidate.
 
 ### 3. Deployment
-Configured for **Vercel** serverless. Required environment variables (for field ID mode only):
+Configured for **Vercel** serverless. Environment variables (for field ID mode only):
 - `SUPABASE_URL`
-- `SUPABASE_ANON_KEY`
+- `SUPABASE_SERVICE_ROLE_KEY` or `SUPABASE_ANON_KEY`
 
-Coordinate mode requires no environment variables — IEM is a public endpoint.
+Coordinate and polygon modes require no environment variables — IEM is a public endpoint.
 
 ### 4. IEM Data Availability
 IEM Stage IV covers the contiguous US (CONUS) only. Locations outside CONUS will return `0` rather than an error. Data typically lags real-time by 1–2 hours.
+
+### 5. Hybrid Merge
+When both `lat`/`lon` (or polygon) and `field_id` are provided, the API takes the MAX of IEM and Supabase values for each window. If the merged 168h total exceeds the IEM-only total by more than 0.05", a `dataWarning` is included.
 
 ---
 
 ## Troubleshooting
 
+### Rainfall shows 0 for a known rain event (coordinate mode)
+IEM Stage IV may have a short processing delay (usually < 2 hours). Try again later, or check with `asOf` set to a time after the data was processed.
+
 ### Rainfall shows 0 in field ID mode but you expect rain
 The Supabase `field_rainfall_hourly` ingestion pipeline may have a gap. Cross-check with coordinate mode using the field's lat/lon — if coordinate mode returns rain, the pipeline missed that event and needs a backfill.
 
-### IEM returns 0 for a known rain event
-IEM Stage IV may have a short processing delay (usually < 2 hours). Try again later, or query with `date=<yesterday>` to ensure the day is fully processed.
-
-### 400 on field ID mode
-Both `field_id` and either `date` or `start_date` are required. Check that all parameters are present.
+### 500 error on all requests
+Previously caused by missing `SUPABASE_URL` env var crashing the Supabase client at module load. Fixed: Supabase client is now lazily initialized only when `field_id` is provided.

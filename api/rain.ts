@@ -5,11 +5,16 @@ import { generateHourKeys, getRequiredDates } from '../lib/time';
 import { fetchIemMultipleDays } from '../lib/iem';
 import { aggregateRain } from '../lib/aggregate';
 
-// Initialize Supabase fallback client
-const supabase = createClient(
-  process.env.SUPABASE_URL || '',
-  process.env.SUPABASE_SERVICE_ROLE_KEY || ''
-);
+let _supabase: any = null;
+function getSupabase() {
+  if (!_supabase && process.env.SUPABASE_URL) {
+    _supabase = createClient(
+      process.env.SUPABASE_URL,
+      process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY || ''
+    );
+  }
+  return _supabase;
+}
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   // 1. CORS Preflight
@@ -69,18 +74,26 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     let fallbackAvailable = false;
 
     if (fieldId) {
+      const supabase = getSupabase();
+      if (!supabase) {
+        return res.status(500).json({
+          error: 'Supabase not configured',
+          detail: 'SUPABASE_URL environment variable is not set on this deployment.'
+        });
+      }
+
       const today = new Date().toISOString().split('T')[0];
       const date24h = new Date(Date.now() - 1 * 86400000).toISOString().split('T')[0];
       const date72h = new Date(Date.now() - 3 * 86400000).toISOString().split('T')[0];
       const date168h = new Date(Date.now() - 7 * 86400000).toISOString().split('T')[0];
       
       const fetchDb = async (start: string) => {
-        const { data, error } = await supabase.rpc('get_rainfall_stats', {
+        const { data, error } = await supabase.rpc('get_rainfall_stats' as any, {
           p_field_id: fieldId,
           p_start_date: start,
           p_end_date: today
         });
-        return error ? 0 : Number(data?.rainfall || 0);
+        return error ? 0 : Number((data as any)?.rainfall || 0);
       };
 
       const [sum24, sum72, sum168] = await Promise.all([
