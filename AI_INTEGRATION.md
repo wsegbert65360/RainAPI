@@ -4,13 +4,14 @@ This document provides all the technical details necessary for an AI coding agen
 
 ## Overview
 
-The Rain API is a Vercel serverless function that provides rainfall totals (12h, 24h, 72h, 168h windows) for a given location or field. It supports **three independent query modes**:
+The Rain API is a Vercel serverless function that provides rainfall totals (12h, 24h, 72h, 168h windows) for a given location or field. It supports **four independent query modes**:
 
 | Mode | Method | Input | Data Source |
 |------|--------|-------|-------------|
 | **Coordinate lookup** | `GET` | `lat` + `lon` | IEM Stage IV radar (direct, always current) |
 | **Polygon lookup** | `POST` | `polygon` body | IEM Stage IV radar (centroid computed, then queried) |
 | **Field ID lookup** | `GET` or `POST` | `field_id` | AcreLedger Supabase RPC `get_rainfall_stats` |
+| **Custom date range** | `GET` | `field_id` + `start_date` + `end_date` | Supabase historical data for the specified range |
 
 When both coordinate and `field_id` inputs are provided, results are merged (MAX of both sources).
 
@@ -103,6 +104,51 @@ Fetch rainfall for a specific AcreLedger field. Must be combined with `lat`/`lon
 
 ---
 
+### Mode D: Custom Date Range
+
+Fetch total rainfall for a specific AcreLedger field over a custom date range. **Requires `field_id`** — no coordinate-only mode available for custom ranges.
+
+**Endpoint:** `GET /rain`
+
+**Query Parameters:**
+
+| Parameter | Type | Required | Description |
+| :--- | :--- | :--- | :--- |
+| `field_id` | string (UUID) | **Yes** | The AcreLedger field UUID |
+| `start_date` | string (YYYY-MM-DD) | **Yes** | Start of the date range (inclusive) |
+| `end_date` | string (YYYY-MM-DD) | **Yes** | End of the date range (inclusive) |
+
+**Example:**
+
+```http
+GET /rain?field_id=550e8400-e29b-41d4-a716-446655440000&start_date=2026-03-15&end_date=2026-04-21
+```
+
+**Response — custom date range differs from standard response:**
+
+```json
+{
+  "location": {
+    "type": "point",
+    "lat": 38.5319,
+    "lon": -93.5331,
+    "fieldId": "550e8400-e29b-41d4-a716-446655440000"
+  },
+  "periodEndUtc": "2026-04-21T12:00:00.000Z",
+  "units": "in",
+  "rain": {
+    "total": 1.47
+  },
+  "rainMm": {
+    "total": 37.34
+  }
+}
+```
+
+> **Important:** The custom range response uses `rain.total` and `rainMm.total` instead of the standard `12h/24h/72h/168h` keys. Integrators must check for `data.rain.total` (not `data.rainfall`).
+
+---
+
 ## Response Schema
 
 **Success (200):**
@@ -159,6 +205,7 @@ For polygon requests, `location` uses `centroidLat`/`centroidLon` instead of `la
 | `rain.24h` | number | 24-hour accumulation in inches |
 | `rain.72h` | number | 72-hour accumulation in inches |
 | `rain.168h` | number | 7-day (168-hour) accumulation in inches |
+| `rain.total` | number | Total accumulation for custom date range (Mode D only) |
 | `rainMm.*` | number | Same windows in millimeters |
 
 ---
