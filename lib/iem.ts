@@ -6,7 +6,7 @@
 const IEM_BASE_URL = 'https://mesonet.agron.iastate.edu/json/stage4.py';
 
 export interface IEMHour {
-  valid: string;
+  end_valid: string;
   precip_in: number | null;
 }
 
@@ -40,8 +40,9 @@ export async function fetchIemDay(
       const json = await res.json() as IEMResponse;
       if (Array.isArray(json?.data)) {
         json.data.forEach(h => {
-          if (h.valid) {
-            hourMap.set(h.valid, Number(h.precip_in || 0));
+          if (h.end_valid && h.precip_in != null) {
+            const key = h.end_valid.slice(0, 10) + ' ' + h.end_valid.slice(11, 13) + ':00';
+            hourMap.set(key, Number(h.precip_in));
           }
         });
         return hourMap; // Success
