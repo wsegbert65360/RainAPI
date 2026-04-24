@@ -8,8 +8,10 @@ Implement the spec in `blueprint.md` as a Vercel serverless API using Node.js + 
 
 - **Endpoint:** `GET /api/rain` (point) and `POST /api/rain` (polygon)
 - **Output:** `rain.{12h,24h,72h}` (inches) plus `rainMm` (mm)
-- **Provider:** IEM Stage IV point query:
+- **Provider:** IEM Stage IV point query + AcreLedger Supabase RPC:
   `https://mesonet.agron.iastate.edu/json/stage4.py?lat=...&lon=...&valid=YYYY-MM-DD&tz=UTC`
+  `RPC get_rainfall_stats(p_field_id, p_start_date, p_end_date)`
+- **Hybrid Strategy:** Calculate MAX of Radar vs Supabase for each shared window (24h, 72h, 168h).
 - **Constraints:** Vercel Hobby 10 s timeout; IEM fetches must be parallel; 8 s upstream abort.
 
 ---
@@ -35,9 +37,10 @@ Single handler for GET + POST:
 3. Compute centroid if polygon.
 4. Compute `periodEndUtc` — applying `tz` to shift "last complete hour" if provided (see Timezone section).
 5. Compute required UTC dates for 72h window.
-6. Fetch IEM dates in parallel with 8 s abort.
-7. Aggregate 12/24/72h totals.
-8. Return JSON with `Cache-Control` header.
+8. Fetch IEM dates in parallel with 8 s abort.
+9. Call Supabase RPC `get_rainfall_stats` if `field_id` is provided.
+10. Aggregate and perform Hybrid Merge (MAX).
+11. Return JSON with `Cache-Control` header.
 
 ### `lib/time.ts`
 - Parse `asOf` (ISO 8601); validate and reject if unparseable.
@@ -256,6 +259,6 @@ Document the confirmed schema as a comment at the top of `lib/iem.ts` before wri
 
 1. Push repo to GitHub.
 2. Vercel dashboard → New Project → import repo → Framework: **Other**.
-3. No environment variables required for base IEM endpoint.
+3. Set `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` (or anon key) in Vercel settings for field ID mode.
 4. Verify both `/api/rain` and `/rain` aliases resolve after first deploy.
 5. Confirm CORS headers present on response: `curl -I "https://your-project.vercel.app/rain?lat=42.03&lon=-93.62"`.

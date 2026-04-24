@@ -2,7 +2,7 @@
 
 **Purpose:** Provide rainfall totals (12h, 24h, 72h) for a given location when called by **Acreledger**. Supports either a single GPS point or a polygon (field shape).
 
-**Data source:** AcreLedger Supabase — utilizes the `get_rainfall_stats` RPC to fetch radar-derived hourly precipitation pre-aggregated by the main application's pipeline.
+**Data source:** IEM Stage IV (Primary Radar) + AcreLedger Supabase (Historical Fallback). Utilizes the `get_rainfall_stats` RPC to fetch pre-aggregated precipitation, merging it with live IEM radar data (hybrid MAX merge).
 
 **Hosting:** Vercel Hobby (free tier, serverless, Git-push deploy).
 
@@ -104,9 +104,10 @@ For a polygon request, `location` includes the computed centroid and `"type": "p
 
 | Code | Condition | Example body |
 |------|-----------|--------------|
-| `400` | Missing or invalid `lat`/`lon`, invalid polygon | `{ "error": "lat and lon are required" }` |
-| `404` | Location outside IEM Stage IV coverage (non-CONUS) | `{ "error": "No Stage IV data for this location" }` |
+| `400` | Missing or invalid `lat`/`lon`, invalid polygon, or invalid `start_date` | `{ "error": "lat and lon are required" }` |
 | `502` | IEM unavailable, timeout, or unexpected response | `{ "error": "IEM request failed", "retryAfterSeconds": 60 }` |
+
+*Note: Locations outside IEM Stage IV coverage (non-CONUS) currently return `0` instead of a 404.*
 
 ---
 
@@ -444,14 +445,14 @@ The following are explicitly not part of this implementation:
 | Item | Decision |
 |------|----------|
 | **Consumer** | Acreledger |
-| **Input** | `field_id` (UUID) + `start_date` / `end_date` |
-| **Output** | Rainfall total in inches |
-| **Data source** | AcreLedger Supabase (RPC) |
-| **Performance** | Sub-200ms |
+| **Input** | `lat`/`lon` (Radar) and/or `field_id` (Supabase Fallback) |
+| **Output** | Rainfall totals (12h, 24h, 72h, 168h) or custom date range total |
+| **Data source** | Hybrid: IEM Stage IV + AcreLedger Supabase (RPC) |
+| **Performance** | Sub-500ms (Hybrid merge) |
 | **Hosting** | Vercel Hobby (free tier) |
 | **Vercel key limit** | 10-second execution — well within limits |
 | **Cold starts** | 0.5–1.5 s first request after idle — acceptable |
-| **Caching** | `Cache-Control: s-maxage=0` (Disabled for backfill accuracy) |
+| **Caching** | `Cache-Control: s-maxage=900, stale-while-revalidate=300` |
 | **Persistent storage** | AcreLedger Supabase |
 | **Memory footprint** | Minimal |
 | **Deploy workflow** | Git push to main → Vercel auto-deploys |

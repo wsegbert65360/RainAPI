@@ -11,7 +11,7 @@ The Rain API is a Vercel serverless function that provides rainfall totals (12h,
 | **Coordinate lookup** | `GET` | `lat` + `lon` | IEM Stage IV radar (direct, always current) |
 | **Polygon lookup** | `POST` | `polygon` body | IEM Stage IV radar (centroid computed, then queried) |
 | **Field ID lookup** | `GET` or `POST` | `field_id` | AcreLedger Supabase RPC `get_rainfall_stats` |
-| **Custom date range** | `GET` | `field_id` + `start_date` + `end_date` | Supabase historical data for the specified range |
+| **Custom date range** | `GET` | `field_id` OR `lat`/`lon` + `start_date` + `end_date` | Hybrid: IEM radar + Supabase historical data (MAX of both) |
 
 When both coordinate and `field_id` inputs are provided, results are merged (MAX of both sources).
 
@@ -106,7 +106,7 @@ Fetch rainfall for a specific AcreLedger field. Must be combined with `lat`/`lon
 
 ### Mode D: Custom Date Range
 
-Fetch total rainfall for a specific AcreLedger field over a custom date range. **Requires `field_id`** — no coordinate-only mode available for custom ranges.
+Fetch total rainfall for a specific field or coordinate over a custom date range. Performs a hybrid merge (MAX) of IEM radar and Supabase data if both a coordinate/polygon and `field_id` are provided.
 
 **Endpoint:** `GET /rain`
 
@@ -114,9 +114,12 @@ Fetch total rainfall for a specific AcreLedger field over a custom date range. *
 
 | Parameter | Type | Required | Description |
 | :--- | :--- | :--- | :--- |
-| `field_id` | string (UUID) | **Yes** | The AcreLedger field UUID |
 | `start_date` | string (YYYY-MM-DD) | **Yes** | Start of the date range (inclusive) |
-| `end_date` | string (YYYY-MM-DD) | **Yes** | End of the date range (inclusive) |
+| `end_date` | string (YYYY-MM-DD) | No | End of the date range (inclusive). Defaults to period end. |
+| `field_id` | string (UUID) | No* | The AcreLedger field UUID. |
+| `lat` / `lon` | number | No* | Coordinates for radar data. |
+
+*\*Requires at least `field_id` or `lat`/`lon`.*
 
 **Example:**
 
@@ -241,7 +244,7 @@ Coordinate and polygon modes require no environment variables — IEM is a publi
 IEM Stage IV covers the contiguous US (CONUS) only. Locations outside CONUS will return `0` rather than an error. Data typically lags real-time by 1–2 hours.
 
 ### 5. Hybrid Merge
-When both `lat`/`lon` (or polygon) and `field_id` are provided, the API takes the MAX of IEM and Supabase values for each window. If the merged 168h total exceeds the IEM-only total by more than 0.05", a `dataWarning` is included.
+When both coordinate/polygon data and a `field_id` are provided, the API takes the MAX of IEM radar and Supabase values for each window. This ensures maximum coverage if radar data is missing or if the Supabase ingestion pipeline experienced a lag. If the merged total exceeds the radar total by more than 0.05", a `dataWarning` is included.
 
 ---
 
