@@ -2,7 +2,7 @@ import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { createClient } from '@supabase/supabase-js';
 import { calculateCentroid } from '../lib/centroid';
 import { generateHourKeys, getRequiredDates } from '../lib/time';
-import { fetchIemMultipleDays } from '../lib/iem';
+import { fetchIemMultipleDays, fetchIemCustomRange } from '../lib/iem';
 import { aggregateRain } from '../lib/aggregate';
 
 let _supabase: any = null;
@@ -69,8 +69,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     if (endDate && !/^\d{4}-\d{2}-\d{2}$/.test(endDate)) {
       return res.status(400).json({ error: 'Invalid end_date', detail: 'Expected YYYY-MM-DD format' });
     }
-    if (startDate && !fieldId) {
-      return res.status(400).json({ error: 'start_date requires field_id', detail: 'Custom date ranges are only available with field_id queries' });
+    if (startDate && !fieldId && !(lat && lon)) {
+      return res.status(400).json({ error: 'start_date requires field_id or lat/lon', detail: 'Custom date ranges need field_id or coordinates to fetch data.' });
     }
 
     // 4. Mode A: IEM Radar Data (Hourly High-Resolution)
@@ -85,6 +85,48 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     let dbTotals = { '24h': 0, '72h': 0, '168h': 0 };
     let fallbackAvailable = false;
 
+    const fetchDb = async (start: string, end: string) => {
+      const supabase = getSupabase();
+      if (!supabase) return 0;
+      const { data, error } = await supabase.rpc('get_rainfall_stats' as any, {
+        p_field_id: fieldId,
+        p_start_date: start,
+        p_end_date: end
+      });
+      if (error) return 0;
+      const row = Array.isArray(data) ? data[0] : data;
+      return Number(row?.total_inches || 0);
+    };
+
+    // 5b. Custom range mode: IEM radar + Supabase, take MAX
+    if (startDate) {
+      const [iemTotal, dbTotal] = await Promise.all([
+        (lat && lon) ? fetchIemCustomRange(lat, lon, startDate, endDate) : Promise.resolve(0),
+        fetchDb(startDate, endDate)
+      ]);
+
+      const total = Math.max(iemTotal, dbTotal);
+
+      let dataWarning: string | undefined;
+      if (dbTotal > iemTotal + 0.05) {
+        dataWarning = `Merged: Radar ${iemTotal.toFixed(2)}" + ${((dbTotal - iemTotal).toFixed(2))}" from historical database`;
+      }
+
+      res.setHeader('Cache-Control', 's-maxage=900, stale-while-revalidate=300');
+      return res.status(200).json({
+        location: {
+          type,
+          ...(type === 'polygon' ? { centroidLat: lat, centroidLon: lon } : { lat, lon }),
+          fieldId
+        },
+        periodEndUtc: periodEndUtc.toISOString(),
+        units: 'in',
+        rain: { total },
+        rainMm: { total: Number((total * 25.4).toFixed(2)) },
+        ...(dataWarning ? { dataWarning } : {})
+      });
+    }
+
     if (fieldId) {
       const supabase = getSupabase();
       if (!supabase) {
@@ -97,34 +139,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const date24h = new Date(periodEndUtc.getTime() - 1 * 86400000).toISOString().split('T')[0];
       const date72h = new Date(periodEndUtc.getTime() - 3 * 86400000).toISOString().split('T')[0];
       const date168h = new Date(periodEndUtc.getTime() - 7 * 86400000).toISOString().split('T')[0];
-      
-      const fetchDb = async (start: string, end: string) => {
-        const { data, error } = await supabase.rpc('get_rainfall_stats' as any, {
-          p_field_id: fieldId,
-          p_start_date: start,
-          p_end_date: end
-        });
-        if (error) return 0;
-        const row = Array.isArray(data) ? data[0] : data;
-        return Number(row?.total_inches || 0);
-      };
-
-      // 5b. Custom range mode: if start_date provided, skip windowed fetches and return single total
-      if (startDate) {
-        const customTotal = await fetchDb(startDate, endDate);
-        res.setHeader('Cache-Control', 's-maxage=900, stale-while-revalidate=300');
-        return res.status(200).json({
-          location: {
-            type,
-            ...(type === 'polygon' ? { centroidLat: lat, centroidLon: lon } : { lat, lon }),
-            fieldId
-          },
-          periodEndUtc: periodEndUtc.toISOString(),
-          units: 'in',
-          rain: { total: Number(customTotal.toFixed(3)) },
-          rainMm: { total: Number((customTotal * 25.4).toFixed(2)) }
-        });
-      }
 
       const [sum24, sum72, sum168] = await Promise.all([
         fetchDb(date24h, endDate),

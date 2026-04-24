@@ -91,3 +91,33 @@ export async function fetchIemMultipleDays(
     clearTimeout(timeoutId);
   }
 }
+
+/**
+ * Fetches IEM radar data for a custom date range and returns total inches.
+ * Generates the date array from startDate to endDate, fetches all days in parallel,
+ * and sums all hourly values.
+ */
+export async function fetchIemCustomRange(
+  lat: number,
+  lon: number,
+  startDate: string,
+  endDate: string,
+  timeoutMs: number = 15000
+): Promise<number> {
+  const dates: string[] = [];
+  const start = new Date(startDate + 'T00:00:00Z');
+  const end = new Date(endDate + 'T00:00:00Z');
+  const current = new Date(start);
+  while (current <= end) {
+    dates.push(current.toISOString().split('T')[0]);
+    current.setUTCDate(current.getUTCDate() + 1);
+  }
+
+  if (dates.length === 0) return 0;
+  if (dates.length > 365) dates.splice(0, dates.length - 365);
+
+  const hourMap = await fetchIemMultipleDays(lat, lon, dates, timeoutMs);
+  let total = 0;
+  hourMap.forEach(val => { total += val; });
+  return Number(total.toFixed(3));
+}
