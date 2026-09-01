@@ -5,15 +5,17 @@
   "description": "Vercel serverless API for 12h/24h/72h rainfall totals.",
   "license": "UNLICENSED",
   "engines": {
-    "node": ">=20"
+    "node": "24.x"
   },
   "scripts": {
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "tsx --test tests/*.test.ts",
     "dev": "tsx tests/dev-server.ts"
   },
   "devDependencies": {
-    "@types/node": "^22.13.10",
+    "@types/node": "^24.0.0",
     "@vercel/node": "^5.0.0",
+    "axios": "^1.13.6",
     "fast-png": "^8.0.0",
     "tsx": "^4.21.0",
     "typescript": "^5.8.2",
@@ -21,7 +23,6 @@
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.100.1",
-    "axios": "^1.13.6",
     "dotenv": "^17.3.1"
   }
 }

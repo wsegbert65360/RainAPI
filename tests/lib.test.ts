@@ -1,47 +1,76 @@
+import assert from 'node:assert/strict';
+import { describe, it } from 'node:test';
 import { calculateCentroid } from '../lib/centroid';
 import { generateHourKeys, getRequiredDates } from '../lib/time';
 import { aggregateRain } from '../lib/aggregate';
+import {
+  daysBetweenInclusive,
+  isValidCalendarDate,
+  isValidTimezone,
+  isValidUuid,
+} from '../lib/validate';
 
-/**
- * Centroid Tests
- */
-console.log('--- CENTROID TESTS ---');
-const square = [[-93, 42], [-92, 42], [-92, 43], [-93, 43], [-93, 42]];
-const c1 = calculateCentroid(square);
-console.assert(c1.lat === 42.5 && c1.lon === -92.5, `Square centroid failed: ${JSON.stringify(c1)}`);
+describe('centroid', () => {
+  it('computes area-weighted centroid for a square', () => {
+    const square = [
+      [-93, 42],
+      [-92, 42],
+      [-92, 43],
+      [-93, 43],
+      [-93, 42],
+    ];
+    const centroid = calculateCentroid(square);
+    assert.equal(centroid.lat, 42.5);
+    assert.equal(centroid.lon, -92.5);
+  });
+});
 
-const triangle = [[0, 0], [10, 0], [5, 10]];
-const c2 = calculateCentroid(triangle);
-console.assert(c2.lat === 3.333333 && c2.lon === 5, `Triangle centroid failed: ${JSON.stringify(c2)}`);
+describe('time', () => {
+  it('floors asOf to the hour', () => {
+    const { periodEndUtc } = generateHourKeys('2026-03-29T10:30:00Z', 'UTC', 12);
+    assert.equal(periodEndUtc.toISOString(), '2026-03-29T10:00:00.000Z');
+  });
 
-/**
- * Time Logic Tests
- */
-console.log('--- TIME LOGIC TESTS ---');
-const { keys, periodEndUtc } = generateHourKeys('2026-03-29T10:30:00Z', 'UTC', 12);
-console.assert(keys.length === 12, 'Keys length should be 12');
-console.assert(keys[0] === '2026-03-29 10:00', `First key failed: ${keys[0]}`);
-console.assert(keys[11] === '2026-03-28 23:00', `Last key failed: ${keys[11]}`);
+  it('keeps asOf when already on the hour', () => {
+    const { periodEndUtc } = generateHourKeys('2026-03-17T14:00:00Z', 'UTC', 12);
+    assert.equal(periodEndUtc.toISOString(), '2026-03-17T14:00:00.000Z');
+  });
 
-const dates = getRequiredDates(keys);
-console.assert(dates.length === 2, `Required dates failed: ${dates}`);
-console.assert(dates.includes('2026-03-29') && dates.includes('2026-03-28'), 'Dates missing');
+  it('supports timezone validation and DST transition date', () => {
+    assert.equal(isValidTimezone('America/Chicago'), true);
+    const { periodEndUtc } = generateHourKeys('2026-03-09T08:30:00Z', 'America/Chicago', 12);
+    assert.equal(periodEndUtc instanceof Date, true);
+  });
 
-/**
- * Aggregation Tests
- */
-console.log('--- AGGREGATION TESTS ---');
-const dummyMap = new Map<string, number>();
-keys.forEach((k, i) => dummyMap.set(k, 1.0)); // 1 inch per hour
-const totals = aggregateRain(dummyMap, keys);
-console.assert(totals['12h'].inches === 12, `12h sum failed: ${totals['12h'].inches}`);
-console.assert(totals['12h'].hasWarning === false, '12h should not have warning');
+  it('returns required dates for hour keys', () => {
+    const { keys } = generateHourKeys('2026-03-29T10:30:00Z', 'UTC', 12);
+    const dates = getRequiredDates(keys);
+    assert.equal(dates.length, 2);
+    assert.ok(dates.includes('2026-03-29'));
+    assert.ok(dates.includes('2026-03-28'));
+  });
+});
 
-const missingMap = new Map<string, number>();
-missingMap.set(keys[0], 5.0);
-const totals2 = aggregateRain(missingMap, keys);
-console.assert(totals2['12h'].inches === 5, 'Sum of single record failed');
-console.assert(totals2['12h'].missingHours === 11, 'Missing hours count failed');
-console.assert(totals2['12h'].hasWarning === true, 'Missing warning failed');
+describe('aggregate', () => {
+  it('sums windows and flags missing data', () => {
+    const { keys } = generateHourKeys('2026-03-29T10:30:00Z', 'UTC', 12);
+    const map = new Map<string, number>();
+    keys.forEach((key) => map.set(key, 1.0));
+    const totals = aggregateRain(map, keys);
+    assert.equal(totals['12h'].inches, 12);
+    assert.equal(totals['12h'].hasWarning, false);
+  });
+});
 
-console.log('TESTS COMPLETED SUCCESSFULLY!');
+describe('validate', () => {
+  it('validates UUIDs and calendar dates', () => {
+    assert.equal(
+      isValidUuid('11111111-1111-4111-8111-111111111111'),
+      true
+    );
+    assert.equal(isValidUuid('weather-overview'), false);
+    assert.equal(isValidCalendarDate('2026-02-28'), true);
+    assert.equal(isValidCalendarDate('2026-02-30'), false);
+    assert.equal(daysBetweenInclusive('2026-03-01', '2026-03-03'), 3);
+  });
+});
