@@ -52,12 +52,14 @@ function createMockRes() {
 function createReq(
   method: string,
   query: Record<string, string | string[] | undefined> = {},
-  body?: Record<string, unknown>
+  body?: Record<string, unknown>,
+  headers?: Record<string, string>
 ): VercelRequest {
   return {
     method,
     query,
     body,
+    headers,
   } as VercelRequest;
 }
 
@@ -602,5 +604,416 @@ describe('rain handler', () => {
     const mock = createMockRes();
     await handler(createReq('OPTIONS', {}), mock.res);
     assert.equal(mock.status, 204);
+  });
+});
+
+const AUTH_TOKEN = 'Bearer super-secret-token';
+const FIELD_LAT = 38.46;
+const FIELD_LNG = -93.53;
+
+interface AuthFake {
+  user?: { id: string } | null;
+  userError?: { status?: number } | null;
+  profileFarm?: string | null;
+  fieldFarm?: string | null;
+  fieldLat?: number | null;
+  fieldLng?: number | null;
+  deletedAt?: string | null;
+  fieldMissing?: boolean;
+  allowed?: boolean | null;
+  rpcError?: boolean;
+  throwOnAuth?: boolean;
+}
+
+function authFake(f: AuthFake = {}) {
+  return {
+    auth: {
+      getUser: async () => {
+        if (f.throwOnAuth) throw new Error('network');
+        return {
+          data: { user: f.user === undefined ? { id: 'u1' } : f.user },
+          error: f.userError ?? null,
+        };
+      },
+    },
+    from: (table: string) => ({
+      select: () => ({
+        eq: () => ({
+          maybeSingle: async () => {
+            if (table === 'profiles') {
+              return {
+                data: { farm_id: f.profileFarm === undefined ? 'farm-a' : f.profileFarm },
+                error: null,
+              };
+            }
+            if (f.fieldMissing) return { data: null, error: null };
+            return {
+              data: {
+                id: FIELD_ID,
+                farm_id: f.fieldFarm === undefined ? 'farm-a' : f.fieldFarm,
+                lat: f.fieldLat === undefined ? FIELD_LAT : f.fieldLat,
+                lng: f.fieldLng === undefined ? FIELD_LNG : f.fieldLng,
+                deleted_at: f.deletedAt ?? null,
+              },
+              error: null,
+            };
+          },
+        }),
+      }),
+    }),
+    rpc: async (name: string) => {
+      if (name === 'rainfall_field_hourly_allowed') {
+        return f.rpcError
+          ? { data: null, error: { message: 'rpc down' } }
+          : { data: f.allowed ?? true, error: null };
+      }
+      return { data: [{ total_inches: 0.4 }], error: null };
+    },
+  };
+}
+
+function captureAuthWarnings() {
+  const lines: string[] = [];
+  const original = console.warn;
+  console.warn = (...args: unknown[]) => {
+    lines.push(args.map((arg) => String(arg)).join(' '));
+  };
+  return {
+    lines,
+    restore() {
+      console.warn = original;
+    },
+    denials() {
+      return lines
+        .map((line) => {
+          try {
+            return JSON.parse(line) as Record<string, unknown>;
+          } catch {
+            return null;
+          }
+        })
+        .filter((entry): entry is Record<string, unknown> => entry?.event === 'rain_auth_denied');
+    },
+  };
+}
+
+describe('rain handler access gate', () => {
+  beforeEach(() => {
+    __test_resetIemMocks();
+    __test_resetSupabase();
+    mockRadarSuccess();
+    process.env.SUPABASE_URL = 'https://example.supabase.co';
+    process.env.SUPABASE_SERVICE_ROLE_KEY = 'service-role-key';
+    delete process.env.RAIN_API_AUTH;
+  });
+
+  afterEach(() => {
+    __test_resetIemMocks();
+    __test_resetSupabase();
+    delete process.env.RAIN_API_AUTH;
+    delete process.env.SUPABASE_URL;
+    delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+  });
+
+  it('off mode is unchanged for a coordinate-only request', async () => {
+    let authCalls = 0;
+    __test_setSupabase({
+      auth: {
+        getUser: async () => {
+          authCalls += 1;
+          throw new Error('should not run');
+        },
+      },
+      from() {
+        throw new Error('should not run');
+      },
+      rpc: async () => {
+        throw new Error('should not run');
+      },
+    } as never);
+    const warn = captureAuthWarnings();
+    try {
+      const mock = createMockRes();
+      await handler(
+        createReq('GET', { lat: '38.46', lon: '-93.53', asOf: '2026-03-17T14:37:00Z' }),
+        mock.res
+      );
+      assert.equal(mock.status, 200);
+      assert.equal(typeof (mock.json.rain as Record<string, number>)['24h'], 'number');
+      assert.equal(authCalls, 0);
+      assert.equal(warn.denials().length, 0);
+    } finally {
+      warn.restore();
+    }
+  });
+
+  it('enforce: 401 when the bearer token is missing', async () => {
+    process.env.RAIN_API_AUTH = 'enforce';
+    __test_setSupabase(authFake({ allowed: true }) as never);
+    const mock = createMockRes();
+    await handler(
+      createReq('GET', {
+        lat: '38.46',
+        lon: '-93.53',
+        field_id: FIELD_ID,
+        asOf: '2026-03-17T14:37:00Z',
+      }),
+      mock.res
+    );
+    assert.equal(mock.status, 401);
+    assert.deepEqual(mock.json, { error: 'Sign in required' });
+  });
+
+  it('enforce: 400 when the request has coordinates but no field_id', async () => {
+    process.env.RAIN_API_AUTH = 'enforce';
+    __test_setSupabase(authFake({ allowed: true }) as never);
+    const mock = createMockRes();
+    await handler(
+      createReq(
+        'GET',
+        { lat: '38.46', lon: '-93.53', asOf: '2026-03-17T14:37:00Z' },
+        undefined,
+        { authorization: AUTH_TOKEN }
+      ),
+      mock.res
+    );
+    assert.equal(mock.status, 400);
+    assert.deepEqual(mock.json, { error: 'field_id required' });
+  });
+
+  it('enforce: 400 for a polygon with no field_id', async () => {
+    process.env.RAIN_API_AUTH = 'enforce';
+    __test_setSupabase(authFake({ allowed: true }) as never);
+    const mock = createMockRes();
+    await handler(
+      createReq(
+        'POST',
+        {},
+        {
+          polygon: [
+            [-93.54, 38.45],
+            [-93.52, 38.45],
+            [-93.52, 38.47],
+            [-93.54, 38.47],
+            [-93.54, 38.45],
+          ],
+        },
+        { authorization: AUTH_TOKEN }
+      ),
+      mock.res
+    );
+    assert.equal(mock.status, 400);
+    assert.deepEqual(mock.json, { error: 'field_id required' });
+  });
+
+  it('enforce: 403 when the field belongs to another farm', async () => {
+    process.env.RAIN_API_AUTH = 'enforce';
+    __test_setSupabase(authFake({ fieldFarm: 'farm-b', allowed: true }) as never);
+    const mock = createMockRes();
+    await handler(
+      createReq(
+        'GET',
+        { lat: '38.46', lon: '-93.53', field_id: FIELD_ID, asOf: '2026-03-17T14:37:00Z' },
+        undefined,
+        { authorization: AUTH_TOKEN }
+      ),
+      mock.res
+    );
+    assert.equal(mock.status, 403);
+    assert.equal(mock.json.error, 'Field not found for this farm');
+  });
+
+  it('enforce: 403 when the field is soft-deleted', async () => {
+    process.env.RAIN_API_AUTH = 'enforce';
+    __test_setSupabase(authFake({ deletedAt: '2026-04-01T00:00:00Z', allowed: true }) as never);
+    const mock = createMockRes();
+    await handler(
+      createReq(
+        'GET',
+        { lat: '38.46', lon: '-93.53', field_id: FIELD_ID, asOf: '2026-03-17T14:37:00Z' },
+        undefined,
+        { authorization: AUTH_TOKEN }
+      ),
+      mock.res
+    );
+    assert.equal(mock.status, 403);
+    assert.equal(mock.json.error, 'Field not found for this farm');
+    assert.equal(mock.json.rain, undefined);
+  });
+
+  it('enforce: 403 when coordinates are more than 10 km from the field', async () => {
+    process.env.RAIN_API_AUTH = 'enforce';
+    __test_setSupabase(authFake({ fieldLat: 41.5, fieldLng: -93.53, allowed: true }) as never);
+    const mock = createMockRes();
+    await handler(
+      createReq(
+        'GET',
+        { lat: '38.46', lon: '-93.53', field_id: FIELD_ID, asOf: '2026-03-17T14:37:00Z' },
+        undefined,
+        { authorization: AUTH_TOKEN }
+      ),
+      mock.res
+    );
+    assert.equal(mock.status, 403);
+    assert.equal(mock.json.error, 'Coordinates do not match this field');
+  });
+
+  it('enforce: 403 for a free plan and 200 for Pro', async () => {
+    process.env.RAIN_API_AUTH = 'enforce';
+    const query = { lat: '38.46', lon: '-93.53', field_id: FIELD_ID, asOf: '2026-03-17T14:37:00Z' };
+
+    __test_setSupabase(authFake({ allowed: false }) as never);
+    let mock = createMockRes();
+    await handler(createReq('GET', query, undefined, { authorization: AUTH_TOKEN }), mock.res);
+    assert.equal(mock.status, 403);
+    assert.deepEqual(mock.json, { error: 'premium_required:rainfall' });
+
+    __test_setSupabase(authFake({ allowed: true }) as never);
+    mock = createMockRes();
+    await handler(createReq('GET', query, undefined, { authorization: AUTH_TOKEN }), mock.res);
+    assert.equal(mock.status, 200);
+    assert.equal(typeof (mock.json.rain as Record<string, number>)['24h'], 'number');
+    assert.equal((mock.json.location as { fieldId?: string }).fieldId, FIELD_ID);
+  });
+
+  it('enforce: 503 when Supabase is not configured', async () => {
+    process.env.RAIN_API_AUTH = 'enforce';
+    delete process.env.SUPABASE_URL;
+    delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+    __test_resetSupabase();
+    const mock = createMockRes();
+    await handler(
+      createReq(
+        'GET',
+        { lat: '38.46', lon: '-93.53', field_id: FIELD_ID, asOf: '2026-03-17T14:37:00Z' },
+        undefined,
+        { authorization: AUTH_TOKEN }
+      ),
+      mock.res
+    );
+    assert.equal(mock.status, 503);
+    assert.deepEqual(mock.json, { error: 'Rainfall access check unavailable' });
+  });
+
+  it('enforce: 503 when the plan RPC errors', async () => {
+    process.env.RAIN_API_AUTH = 'enforce';
+    __test_setSupabase(authFake({ rpcError: true, allowed: true }) as never);
+    const mock = createMockRes();
+    await handler(
+      createReq(
+        'GET',
+        { lat: '38.46', lon: '-93.53', field_id: FIELD_ID, asOf: '2026-03-17T14:37:00Z' },
+        undefined,
+        { authorization: AUTH_TOKEN }
+      ),
+      mock.res
+    );
+    assert.equal(mock.status, 503);
+    assert.equal(mock.json.error, 'Rainfall access check unavailable');
+    assert.equal(mock.json.rain, undefined);
+  });
+
+  it('log mode serves a coordinate request when Supabase is not configured', async () => {
+    process.env.RAIN_API_AUTH = 'log';
+    delete process.env.SUPABASE_URL;
+    delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+    __test_resetSupabase();
+    const warn = captureAuthWarnings();
+    try {
+      const mock = createMockRes();
+      await handler(
+        createReq(
+          'GET',
+          { lat: '38.46', lon: '-93.53', asOf: '2026-03-17T14:37:00Z' },
+          undefined,
+          { authorization: AUTH_TOKEN }
+        ),
+        mock.res
+      );
+      assert.equal(mock.status, 200);
+      assert.equal(warn.denials()[0]?.reason, 'auth_unavailable');
+      assert.equal(warn.denials()[0]?.status, 503);
+      assert.equal(JSON.stringify(warn.lines).includes('super-secret-token'), false);
+    } finally {
+      warn.restore();
+    }
+  });
+
+  it('log mode does not replace a field-only custom range with stored coordinates', async () => {
+    process.env.RAIN_API_AUTH = 'log';
+    let radarCalls = 0;
+    __test_setIemMocks({
+      fetchIemCustomRange: async () => {
+        radarCalls += 1;
+        return customRangeSuccessResult();
+      },
+    });
+    __test_setSupabase(authFake({ allowed: true }) as never);
+    const mock = createMockRes();
+    await handler(
+      createReq(
+        'GET',
+        { field_id: FIELD_ID, start_date: '2026-03-01', end_date: '2026-03-17' },
+        undefined,
+        { authorization: AUTH_TOKEN }
+      ),
+      mock.res
+    );
+    assert.equal(mock.status, 200);
+    assert.equal(radarCalls, 0);
+    assert.equal((mock.json.rain as { total: number }).total, 0.4);
+  });
+
+  it('log mode serves the request and logs the would-be denial', async () => {
+    process.env.RAIN_API_AUTH = 'log';
+    __test_setSupabase(authFake({ allowed: false }) as never);
+    const warn = captureAuthWarnings();
+    try {
+      const mock = createMockRes();
+      await handler(
+        createReq(
+          'GET',
+          { lat: '38.46', lon: '-93.53', field_id: FIELD_ID, asOf: '2026-03-17T14:37:00Z' },
+          undefined,
+          { authorization: AUTH_TOKEN }
+        ),
+        mock.res
+      );
+      assert.equal(mock.status, 200);
+      assert.equal(typeof (mock.json.rain as Record<string, number>)['24h'], 'number');
+      const denial = warn.denials()[0];
+      assert.equal(denial?.mode, 'log');
+      assert.equal(denial?.reason, 'premium_required');
+      assert.equal(denial?.fieldId, FIELD_ID);
+      assert.equal(JSON.stringify(warn.lines).includes('super-secret-token'), false);
+    } finally {
+      warn.restore();
+    }
+  });
+
+  it('enforce uses stored field coordinates when a custom range has no request point', async () => {
+    process.env.RAIN_API_AUTH = 'enforce';
+    let seen: { lat?: number; lon?: number } = {};
+    __test_setIemMocks({
+      fetchIemCustomRange: async (lat: number, lon: number) => {
+        seen = { lat, lon };
+        return customRangeSuccessResult();
+      },
+    });
+    __test_setSupabase(authFake({ allowed: true }) as never);
+    const mock = createMockRes();
+    await handler(
+      createReq(
+        'GET',
+        { field_id: FIELD_ID, start_date: '2026-03-01', end_date: '2026-03-17' },
+        undefined,
+        { authorization: AUTH_TOKEN }
+      ),
+      mock.res
+    );
+    assert.equal(mock.status, 200);
+    assert.equal(seen.lat, FIELD_LAT);
+    assert.equal(seen.lon, FIELD_LNG);
+    assert.equal((mock.json.rain as { total: number }).total, 1.25);
   });
 });

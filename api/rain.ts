@@ -135,21 +135,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return badRequest(res, 'Invalid field_id', 'field_id must be a valid UUID.');
     }
 
-    const authMode = readRainAuthMode();
-    if (authMode !== 'off') {
-      const decision = await decideRainAccess({
-        supabase: getSupabase(),
-        authorization: req.headers?.authorization,
-        fieldId,
-      });
-      if (!decision.allow) {
-        console.warn(JSON.stringify({ event: 'rain_auth_denied', mode: authMode, reason: decision.reason, fieldId: fieldId ?? null }));
-        if (authMode === 'enforce') {
-          return res.status(decision.status).json({ error: decision.error });
-        }
-      }
-    }
-
     if (req.method === 'POST') {
       const body = req.body || {};
       const polygon =
@@ -193,6 +178,40 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         lat = parsedLat;
         lon = parsedLon;
         type = 'point';
+      }
+    }
+
+    const authMode = readRainAuthMode();
+    if (authMode !== 'off') {
+      const decision = await decideRainAccess({
+        supabase: getSupabase(),
+        authorization: req.headers?.authorization,
+        fieldId,
+        lat,
+        lon,
+      });
+      if (!decision.allow) {
+        // Reason and field id only. Never include the bearer token or other secrets.
+        console.warn(JSON.stringify({
+          event: 'rain_auth_denied',
+          mode: authMode,
+          reason: decision.reason,
+          status: decision.status,
+          fieldId: fieldId ?? null,
+        }));
+        if (authMode === 'enforce') {
+          return res.status(decision.status).json({ error: decision.error });
+        }
+      } else if (
+        authMode === 'enforce' &&
+        lat === undefined &&
+        lon === undefined &&
+        decision.fieldLat !== undefined &&
+        decision.fieldLng !== undefined
+      ) {
+        // Custom range (and any other field_id request) with no point uses the stored field location.
+        lat = decision.fieldLat;
+        lon = decision.fieldLng;
       }
     }
 

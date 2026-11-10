@@ -4,19 +4,34 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 //
 //   RAIN_API_AUTH=off      (default) no check; today's behavior, old app builds keep working.
 //   RAIN_API_AUTH=log      run the check, log would-be denials as JSON, serve the request anyway.
-//   RAIN_API_AUTH=enforce  refuse unauthenticated callers (401) and fields the farm may not have
-//                          hourly rainfall for (403 premium_required:rainfall).
+//   RAIN_API_AUTH=enforce  apply the decision. Fail closed: a Supabase or lookup failure is a 503,
+//                          never a served rainfall total.
 //
-// Field requests are decided by the database function rainfall_field_hourly_allowed (the same rule the
-// collectors use: free plan + enforce mode => not allowed). Coordinate-only requests cannot be tied to a
-// farm plan, so they only need a valid login. Infrastructure errors fail open (logged) so a Supabase
-// hiccup never turns off rainfall for paying farms.
+// Enforce requires a Supabase bearer token, a field_id that belongs to the caller's farm and is not
+// soft-deleted, request coordinates within FIELD_MATCH_RADIUS_KM of the field's stored lat/lng
+// (or the stored point when the request has none), and rainfall_field_hourly_allowed(p_field_id).
+// Do not log tokens or secrets. The handler logs only the denial reason.
 
 export type RainAuthMode = 'off' | 'log' | 'enforce';
 
 export type RainAuthDecision =
-  | { allow: true; reason?: string }
-  | { allow: false; status: 401 | 403; error: string; reason: string };
+  | { allow: true; reason?: string; fieldLat?: number; fieldLng?: number }
+  | { allow: false; status: 400 | 401 | 403 | 503; error: string; reason: string };
+
+export const FIELD_MATCH_RADIUS_KM = 10;
+
+const EARTH_RADIUS_KM = 6371;
+// One meter of slack so a point on the 10 km circle is not rejected by floating-point error.
+const FIELD_MATCH_EPSILON_KM = 0.001;
+const UNAVAILABLE_ERROR = 'Rainfall access check unavailable';
+
+interface FieldAccessRow {
+  id?: string;
+  farm_id?: string | null;
+  lat?: number | string | null;
+  lng?: number | string | null;
+  deleted_at?: string | null;
+}
 
 export function readRainAuthMode(raw: string | undefined = process.env.RAIN_API_AUTH): RainAuthMode {
   const value = (raw ?? '').trim().toLowerCase();
@@ -30,45 +45,115 @@ export function readBearerToken(header: unknown): string | null {
   return match ? match[1] : null;
 }
 
+export function haversineKm(lat1: number, lon1: number, lat2: number, lon2: number): number {
+  const toRad = (degrees: number) => (degrees * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  const c = 2 * Math.atan2(Math.sqrt(Math.max(0, a)), Math.sqrt(Math.max(0, 1 - a)));
+  return EARTH_RADIUS_KM * c;
+}
+
+function deny(
+  status: 400 | 401 | 403 | 503,
+  error: string,
+  reason: string
+): RainAuthDecision {
+  return { allow: false, status, error, reason };
+}
+
+function unavailable(reason: string): RainAuthDecision {
+  return deny(503, UNAVAILABLE_ERROR, reason);
+}
+
+function isDefinitiveAuthRejection(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false;
+  const status = (error as { status?: unknown }).status;
+  return typeof status === 'number' && status >= 400 && status < 500;
+}
+
+function readStoredCoordinate(value: unknown, kind: 'lat' | 'lng'): number | null {
+  if (typeof value === 'string' && value.trim() === '') return null;
+  const parsed = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : NaN;
+  if (!Number.isFinite(parsed)) return null;
+  if (kind === 'lat' && (parsed < -90 || parsed > 90)) return null;
+  if (kind === 'lng' && (parsed < -180 || parsed > 180)) return null;
+  return parsed;
+}
+
 export async function decideRainAccess(args: {
   supabase: SupabaseClient | null;
   authorization: unknown;
   fieldId?: string;
+  lat?: number;
+  lon?: number;
 }): Promise<RainAuthDecision> {
-  const { supabase, authorization, fieldId } = args;
-  if (!supabase) return { allow: true, reason: 'auth_unavailable' };
+  const { supabase, authorization, fieldId, lat, lon } = args;
+
+  if (!supabase) return unavailable('auth_unavailable');
 
   const token = readBearerToken(authorization);
-  if (!token) return { allow: false, status: 401, error: 'Sign in required', reason: 'no_token' };
+  if (!token) return deny(401, 'Sign in required', 'no_token');
 
+  let userId: string;
   try {
     const { data, error } = await supabase.auth.getUser(token);
-    if (error || !data?.user) {
-      // A rejected token is definitive; a transport failure is not.
-      const status = (error as { status?: number } | null)?.status;
-      if (status && status >= 500) return { allow: true, reason: 'auth_unavailable' };
-      return { allow: false, status: 401, error: 'Sign in required', reason: 'invalid_token' };
+    if (error || !data?.user?.id) {
+      if (error && !isDefinitiveAuthRejection(error)) return unavailable('auth_unavailable');
+      return deny(401, 'Sign in required', 'invalid_token');
     }
-    if (!fieldId) return { allow: true };
+    userId = data.user.id;
+  } catch {
+    return unavailable('auth_unavailable');
+  }
 
-    const profile = await supabase.from('profiles').select('farm_id').eq('id', data.user.id).maybeSingle();
-    if (profile.error) return { allow: true, reason: 'lookup_failed' };
-    const field = await supabase.from('fields').select('farm_id').eq('id', fieldId).maybeSingle();
-    if (field.error) return { allow: true, reason: 'lookup_failed' };
+  if (!fieldId) return deny(400, 'field_id required', 'field_id_required');
 
-    const farmId = (profile.data as { farm_id?: string | null } | null)?.farm_id;
-    const fieldFarmId = (field.data as { farm_id?: string | null } | null)?.farm_id;
-    if (!farmId || !fieldFarmId || farmId !== fieldFarmId) {
-      return { allow: false, status: 403, error: 'Field not found for this farm', reason: 'wrong_farm' };
+  try {
+    const profile = await supabase.from('profiles').select('farm_id').eq('id', userId).maybeSingle();
+    if (profile.error) return unavailable('lookup_failed');
+
+    const field = await supabase
+      .from('fields')
+      .select('id, farm_id, lat, lng, deleted_at')
+      .eq('id', fieldId)
+      .maybeSingle();
+    if (field.error) return unavailable('lookup_failed');
+
+    const farmId = (profile.data as { farm_id?: string | null } | null)?.farm_id ?? null;
+    const fieldRow = (field.data as FieldAccessRow | null) ?? null;
+    const fieldFarmId = fieldRow?.farm_id ?? null;
+    // Same public error for a missing field, a wrong farm, and a soft-deleted field.
+    // Farm is checked first so a deleted field on another farm is not labeled as deleted in the log.
+    if (!fieldRow || !farmId || !fieldFarmId || farmId !== fieldFarmId) {
+      return deny(403, 'Field not found for this farm', 'wrong_farm');
+    }
+    if (fieldRow.deleted_at != null) {
+      return deny(403, 'Field not found for this farm', 'field_deleted');
+    }
+
+    const fieldLat = readStoredCoordinate(fieldRow.lat, 'lat');
+    const fieldLng = readStoredCoordinate(fieldRow.lng, 'lng');
+    if (fieldLat === null || fieldLng === null) {
+      return deny(403, 'Coordinates do not match this field', 'coords_missing');
+    }
+
+    const hasRequestPoint =
+      lat !== undefined && lon !== undefined && Number.isFinite(lat) && Number.isFinite(lon);
+    if (hasRequestPoint && haversineKm(lat, lon, fieldLat, fieldLng) > FIELD_MATCH_RADIUS_KM + FIELD_MATCH_EPSILON_KM) {
+      return deny(403, 'Coordinates do not match this field', 'coords_too_far');
     }
 
     const allowed = await supabase.rpc('rainfall_field_hourly_allowed', { p_field_id: fieldId });
-    if (allowed.error) return { allow: true, reason: 'lookup_failed' };
+    if (allowed.error) return unavailable('lookup_failed');
     if (allowed.data !== true) {
-      return { allow: false, status: 403, error: 'premium_required:rainfall', reason: 'premium_required' };
+      return deny(403, 'premium_required:rainfall', 'premium_required');
     }
-    return { allow: true };
+
+    return { allow: true, fieldLat, fieldLng };
   } catch {
-    return { allow: true, reason: 'auth_unavailable' };
+    return unavailable('lookup_failed');
   }
 }
