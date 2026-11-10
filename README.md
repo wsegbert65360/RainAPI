@@ -86,3 +86,22 @@ npm run typecheck
 ## Deployment
 
 Push to `main` branch for automatic Vercel deployment. Ensure `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` (or `SUPABASE_ANON_KEY`) are configured in the Vercel project settings if field ID mode is needed.
+
+## Access gate (RAIN_API_AUTH)
+
+AcreLedger's free tier limits hourly rainfall to farms on Pro (or any farm while the app's entitlements are not enforced).
+`api/rain.ts` calls `lib/auth.ts` when `RAIN_API_AUTH` is set:
+
+| Value | Behavior |
+|---|---|
+| `off` (default, or unset) | No check. Old and new app builds work. |
+| `log` | Runs the check, logs `rain_auth_denied` JSON lines, serves the request anyway. |
+| `enforce` | 401 `Sign in required` with no valid Supabase bearer token; 403 `premium_required:rainfall` when the field belongs to another farm or `rainfall_field_hourly_allowed(field_id)` is false. |
+
+- Field requests are decided by the AcreLedger database (`rainfall_field_hourly_allowed`, service role). Coordinate-only requests
+  (no `field_id`) only need a valid login, because coordinates cannot be tied to a farm plan. The app sends `field_id` whenever it has one.
+- Infrastructure errors (Supabase unreachable) fail open and are logged, so an outage never turns off rain for paying farms.
+- CORS now allows the `Authorization` header.
+- Roll out in order: deploy this with `RAIN_API_AUTH=log`, ship the app that sends the token, watch the logs, then set `enforce`.
+  Needs `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` (already used by this API) and the AcreLedger migration
+  `20261107060000_rainfall_hourly_field_allowed.sql`.
