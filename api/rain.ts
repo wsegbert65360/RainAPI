@@ -9,6 +9,7 @@ import {
   IemFetchError,
 } from '../lib/iem';
 import { aggregateRain } from '../lib/aggregate';
+import { decideRainAccess, readRainAuthMode } from '../lib/auth';
 import {
   daysBetweenInclusive,
   isValidCalendarDate,
@@ -46,7 +47,7 @@ function getSupabase(): SupabaseClient | null {
 function setCors(res: VercelResponse): void {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 }
 
 function badRequest(res: VercelResponse, error: string, detail: string) {
@@ -132,6 +133,21 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     if (fieldId && !isValidUuid(fieldId)) {
       return badRequest(res, 'Invalid field_id', 'field_id must be a valid UUID.');
+    }
+
+    const authMode = readRainAuthMode();
+    if (authMode !== 'off') {
+      const decision = await decideRainAccess({
+        supabase: getSupabase(),
+        authorization: req.headers?.authorization,
+        fieldId,
+      });
+      if (!decision.allow) {
+        console.warn(JSON.stringify({ event: 'rain_auth_denied', mode: authMode, reason: decision.reason, fieldId: fieldId ?? null }));
+        if (authMode === 'enforce') {
+          return res.status(decision.status).json({ error: decision.error });
+        }
+      }
     }
 
     if (req.method === 'POST') {
