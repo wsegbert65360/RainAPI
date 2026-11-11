@@ -48,7 +48,7 @@ function extractRainfall(data: Buffer, coords: any[]) {
         offset += sectLen;
     }
 
-    if (!section5 || section7Offset === -1) return coords.map(() => 0);
+    if (!section5 || section7Offset === -1) return { results: coords.map(() => 0), rainCount: 0 };
 
     const { ref, exp, decimal } = section5;
     const pngData = data.slice(section7Offset);
@@ -58,7 +58,7 @@ function extractRainfall(data: Buffer, coords: any[]) {
         const decoded = decode(pngData);
         pixels = decoded.data;
     } catch (e: any) {
-        return coords.map(() => 0);
+        return { results: coords.map(() => 0), rainCount: 0 };
     }
 
     const multiplier = (Math.pow(2, exp) / Math.pow(10, decimal)) * 0.0393701; // mm to inches

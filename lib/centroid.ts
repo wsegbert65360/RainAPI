@@ -35,9 +35,14 @@ export function calculateCentroid(coordsOrPolygon: unknown): { lat: number; lon:
   let centroidLon = 0;
   let centroidLat = 0;
 
+  // Work relative to the first vertex: raw lon/lat products lose precision for small fields.
+  const [originX, originY] = ring[0];
+
   for (let i = 0; i < ring.length; i++) {
-    const [x0, y0] = ring[i];
-    const [x1, y1] = ring[(i + 1) % ring.length];
+    const x0 = ring[i][0] - originX;
+    const y0 = ring[i][1] - originY;
+    const x1 = ring[(i + 1) % ring.length][0] - originX;
+    const y1 = ring[(i + 1) % ring.length][1] - originY;
     const cross = x0 * y1 - x1 * y0;
     area += cross;
     centroidLon += (x0 + x1) * cross;
@@ -50,7 +55,7 @@ export function calculateCentroid(coordsOrPolygon: unknown): { lat: number; lon:
   }
 
   return {
-    lon: Number((centroidLon / (6 * area)).toFixed(6)),
-    lat: Number((centroidLat / (6 * area)).toFixed(6)),
+    lon: Number((originX + centroidLon / (6 * area)).toFixed(6)),
+    lat: Number((originY + centroidLat / (6 * area)).toFixed(6)),
   };
 }

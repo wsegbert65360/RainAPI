@@ -94,7 +94,9 @@ Fetch rainfall for a field boundary. Computes the centroid and queries IEM Stage
 
 ### Mode C: Field ID Lookup (Supabase)
 
-Fetch rainfall for a specific AcreLedger field. Must be combined with `lat`/`lon` for IEM data, or used alone (returns zeros if no coordinates are provided).
+Fetch rainfall for a specific AcreLedger field. Combine with `lat`/`lon` to merge radar and database data (recommended; AcreLedger does this). Used alone, only database totals are returned and `rain.12h` is `0` because the database fallback has no 12h window.
+
+Database windows are summed over **exact hourly windows** from `field_rainfall_hourly` (rows with `finalized = true` or `source = 'Pass 2'`): a row stamped at `periodEndUtc - i hours` counts toward every window longer than `i` hours. If the hourly query fails, the API falls back to calendar-day totals from the `get_rainfall_stats` RPC.
 
 **Query Parameters:**
 
@@ -194,7 +196,9 @@ For polygon requests, `location` uses `centroidLat`/`centroidLon` instead of `la
 }
 ```
 
-**Optional `dataWarning` field** (string) — present when more than 10% of hourly data is missing in a window, or when Supabase data was merged and added rain beyond what IEM reported.
+**Also returned:** `sourceStatus` — `{ "radar": "ok" | "unavailable", "database": "ok" | "unavailable" }`, showing which sources contributed.
+
+**Optional `dataWarning` field** (string) — present when more than 10% of hourly data is missing in a window, when a source was unavailable, or when Supabase data was merged and added rain beyond what IEM reported.
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -217,11 +221,14 @@ For polygon requests, `location` uses `centroidLat`/`centroidLon` instead of `la
 
 | Code | Condition | Body |
 |------|-----------|------|
-| `400` | Missing `lat`/`lon` (and no polygon body) | `{ "error": "Internal Server Error", "detail": "..." }` |
-| `500` | Supabase not configured (field ID mode without env vars) | `{ "error": "Supabase not configured", "detail": "SUPABASE_URL environment variable is not set..." }` |
-| `500` | Any unhandled error | `{ "error": "Internal Server Error", "detail": "<error message>" }` |
+| `400` | Invalid or missing input: bad `lat`/`lon`, `field_id` not a UUID, bad `tz`/`asOf`/dates, repeated query params, invalid polygon, malformed JSON body, no location given | `{ "error": "...", "detail": "..." }` |
+| `401` | `RAIN_API_AUTH=enforce` and no valid Supabase bearer token | `{ "error": "Sign in required" }` |
+| `403` | `RAIN_API_AUTH=enforce` and the field belongs to another farm (`Field not found for this farm`) or the farm lacks the rainfall entitlement (`premium_required:rainfall`) | `{ "error": "..." }` |
+| `405` | Method other than GET, POST, OPTIONS | `{ "error": "Method Not Allowed" }` |
+| `502` | No usable data: radar timeout/failure, non-CONUS location (no radar data), or radar and database both unavailable | `{ "error": "Upstream data unavailable", "detail": "...", "retryAfterSeconds": 60 }` |
+| `500` | Unhandled error | `{ "error": "Internal Server Error" }` |
 
-> **Note:** The current handler does not return explicit 400 or 404 status codes for invalid inputs or non-CONUS locations. Invalid coordinates result in `rain` values of `0`. Field ID mode without Supabase env vars returns a 500.
+> **Note:** Field mode degrades gracefully. If only one of radar or database works, the API returns `200` with `sourceStatus` showing which source was unavailable and a `dataWarning`. Non-CONUS coordinates return `502` (not zeros and not `404`).
 
 ---
 
@@ -231,20 +238,28 @@ For polygon requests, `location` uses `centroidLat`/`centroidLon` instead of `la
 CORS headers (`Access-Control-Allow-Origin: *`) are set on all responses — safe to call directly from a browser with `fetch` or `axios`. No API key required.
 
 ### 2. Caching Strategy
-All responses use `Cache-Control: s-maxage=900, stale-while-revalidate=300` — cached 15 minutes at the CDN edge with 5 minutes of stale-while-revalidate.
+- Coordinate/polygon requests: `Cache-Control: s-maxage=300, stale-while-revalidate=60` (5 minutes at the CDN).
+- Field ID requests and custom date ranges: `private, no-store`.
+- When `RAIN_API_AUTH=enforce`, every successful response is `private, no-store` with `Vary: Authorization`.
 
 ### 3. Deployment
-Configured for **Vercel** serverless. Environment variables (for field ID mode only):
-- `SUPABASE_URL`
-- `SUPABASE_SERVICE_ROLE_KEY` or `SUPABASE_ANON_KEY`
+Configured for **Vercel** serverless (Hobby: 10-second function limit; radar uses an 8s timeout and radar/database are queried concurrently). Environment variables:
+- `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` — field ID mode and the auth gate. The handler reads the service-role key (not the anon key).
+- `RAIN_API_AUTH` — optional: `off` (default), `log`, or `enforce`. See the README "Access gate" section. The gate relies on the database function `rainfall_field_hourly_allowed`; if it is missing or errors, the gate fails open.
 
 Coordinate and polygon modes require no environment variables — IEM is a public endpoint.
 
 ### 4. IEM Data Availability
-IEM Stage IV covers the contiguous US (CONUS) only. Locations outside CONUS will return `0` rather than an error. Data typically lags real-time by 1–2 hours.
+IEM Stage IV covers the contiguous US (CONUS) only. Locations without radar data return `502`. Data typically lags real-time by 1–2 hours, so the newest one or two hourly keys are often missing (not flagged unless more than 10% of a window is missing).
 
 ### 5. Hybrid Merge
-When both coordinate/polygon data and a `field_id` are provided, the API takes the MAX of IEM radar and Supabase values for each window. This ensures maximum coverage if radar data is missing or if the Supabase ingestion pipeline experienced a lag. If the merged total exceeds the radar total by more than 0.05", a `dataWarning` is included.
+When both coordinate/polygon data and a `field_id` are provided, the API takes the MAX of IEM radar and Supabase values for each of the 24h/72h/168h windows (12h is radar only). This ensures maximum coverage if radar data is missing or if the Supabase ingestion pipeline experienced a lag. If the merged 7-day total exceeds the radar total by more than 0.05", a `dataWarning` is included.
+
+### 6. Access gate (`RAIN_API_AUTH`)
+When `enforce`, callers must send `Authorization: Bearer <Supabase access token>`. Field requests are also checked against the caller's farm and plan. See README for the rollout order (`log` first, then `enforce`).
+
+### 7. Local credentials note
+`.env.vercel` (a Vercel CLI development token, `VERCEL_OIDC_TOKEN`) was previously committed. It **expired 2026-03-28** and is now untracked and gitignored. Refresh with `vercel env pull` when needed; never commit `.env*` files.
 
 ---
 

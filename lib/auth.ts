@@ -51,10 +51,12 @@ export async function decideRainAccess(args: {
     }
     if (!fieldId) return { allow: true };
 
-    const profile = await supabase.from('profiles').select('farm_id').eq('id', data.user.id).maybeSingle();
-    if (profile.error) return { allow: true, reason: 'lookup_failed' };
-    const field = await supabase.from('fields').select('farm_id').eq('id', fieldId).maybeSingle();
-    if (field.error) return { allow: true, reason: 'lookup_failed' };
+    // Independent lookups: run together to conserve the 10s serverless budget.
+    const [profile, field] = await Promise.all([
+      supabase.from('profiles').select('farm_id').eq('id', data.user.id).maybeSingle(),
+      supabase.from('fields').select('farm_id').eq('id', fieldId).maybeSingle(),
+    ]);
+    if (profile.error || field.error) return { allow: true, reason: 'lookup_failed' };
 
     const farmId = (profile.data as { farm_id?: string | null } | null)?.farm_id;
     const fieldFarmId = (field.data as { farm_id?: string | null } | null)?.farm_id;

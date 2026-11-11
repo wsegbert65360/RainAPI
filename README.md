@@ -85,7 +85,12 @@ npm run typecheck
 
 ## Deployment
 
-Push to `main` branch for automatic Vercel deployment. Ensure `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` (or `SUPABASE_ANON_KEY`) are configured in the Vercel project settings if field ID mode is needed.
+Push to `main` branch for automatic Vercel deployment. Ensure `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` (the anon key is not used by the API) are configured in the Vercel project settings if field ID mode is needed.
+
+## Security notes
+
+- `.env.vercel` (Vercel CLI `VERCEL_OIDC_TOKEN`) was committed in early history. The token **expired on 2026-03-28** and the file is now untracked and gitignored. Refresh with `vercel env pull`; never commit `.env*` files.
+- With `RAIN_API_AUTH` unset (`off`) the API is open, and it reads Supabase with the service-role key, so anyone holding a field UUID can read that field's rainfall. Roll out the gate (below) when ready.
 
 ## Access gate (RAIN_API_AUTH)
 

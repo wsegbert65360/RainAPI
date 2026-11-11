@@ -260,3 +260,17 @@ Records missing `epaRegistrationNumber` are flagged `NON-COMPLIANT` at three lev
 ### 6.3 API Key Protection
 
 API keys and secrets MUST NEVER be logged to console in any environment. Log only `error.message`, never the full error object. Secrets stored only in Vercel environment variables, never committed to the repository.
+
+
+---
+
+## 7. Rain API (`api/rain.ts`) - Contract AcreLedger Depends On
+
+Standalone Vercel function; AcreLedger calls `GET /rain?lat=..&lon=..&field_id=..` (and `start_date`/`end_date` for ranges). Full reference: `AI_INTEGRATION.md`.
+
+- **Rolling windows** (`rain.12h/24h/72h/168h`, `rainMm.*`): radar (IEM Stage IV) merged with the database by MAX for 24h/72h/168h; 12h is radar only. Database windows are exact hourly sums over `field_rainfall_hourly` (finalized or Pass 2 rows), falling back to calendar-day `get_rainfall_stats` totals if the hourly query fails.
+- **Custom range** (`rain.total`, `rainMm.total`): calendar-day totals via `get_rainfall_stats`, MAX with radar when coordinates are supplied (radar covers at most the last 365 days).
+- **Always present:** `location`, `periodEndUtc`, `units: "in"`, `sourceStatus {radar, database}`; `dataWarning` when degraded.
+- **Do not break:** these response keys, the 502 `retryAfterSeconds` shape, and the 200-with-`sourceStatus` degradation when only one source works.
+- **Access gate:** `RAIN_API_AUTH` = `off` (default) / `log` / `enforce`; needs the `rainfall_field_hourly_allowed` database function before `enforce` does anything (it fails open if the function is missing).
+- **Env:** `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, optional `RAIN_API_AUTH`.
