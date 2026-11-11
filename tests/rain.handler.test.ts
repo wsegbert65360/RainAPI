@@ -600,6 +600,68 @@ describe('rain handler', () => {
     assert.equal(typeof mock.json.periodEndUtc, 'string');
   });
 
+  function mockHourlyDb(rows: Array<{ timestamp_utc: string; rainfall_in: number }>) {
+    const chain: Record<string, unknown> = {};
+    for (const m of ['select', 'eq', 'gt', 'lte', 'or']) chain[m] = () => chain;
+    chain.then = (resolve: (v: unknown) => void) => resolve({ data: rows, error: null });
+    __test_setSupabase({
+      from: () => chain,
+      rpc: async () => ({ data: [{ total_inches: 99 }], error: null }),
+    } as never);
+  }
+
+  it('sums database rain over exact hourly windows, not calendar days', async () => {
+    mockRadarWithZeros();
+    // periodEnd = 2026-03-17T14:00Z
+    mockHourlyDb([
+      { timestamp_utc: '2026-03-17T14:00:00Z', rainfall_in: 0.2 }, // age 0   -> 12h/24h/72h/168h
+      { timestamp_utc: '2026-03-17T02:00:00Z', rainfall_in: 0.3 }, // age 12  -> 24h and up
+      { timestamp_utc: '2026-03-16T13:00:00Z', rainfall_in: 0.4 }, // age 25  -> 72h and up
+      { timestamp_utc: '2026-03-12T13:00:00Z', rainfall_in: 0.5 }, // age 121 -> 168h only
+      { timestamp_utc: '2026-03-10T13:00:00Z', rainfall_in: 9 },   // age 193 -> outside
+    ]);
+    const mock = createMockRes();
+    await handler(
+      createReq('GET', {
+        lat: '38.46',
+        lon: '-93.53',
+        field_id: FIELD_ID,
+        asOf: '2026-03-17T14:37:00Z',
+      }),
+      mock.res
+    );
+    assert.equal(mock.status, 200);
+    const rain = mock.json.rain as Record<string, number>;
+    assert.equal(rain['24h'], 0.5);
+    assert.equal(rain['72h'], 0.9);
+    assert.equal(rain['168h'], 1.4);
+    assert.equal((mock.json.sourceStatus as { database: string }).database, 'ok');
+  });
+
+  it('falls back to the RPC when the hourly query fails', async () => {
+    mockRadarWithZeros();
+    const chain: Record<string, unknown> = {};
+    for (const m of ['select', 'eq', 'gt', 'lte', 'or']) chain[m] = () => chain;
+    chain.then = (resolve: (v: unknown) => void) => resolve({ data: null, error: { message: 'boom' } });
+    __test_setSupabase({
+      from: () => chain,
+      rpc: async () => ({ data: [{ total_inches: 0.75 }], error: null }),
+    } as never);
+    const mock = createMockRes();
+    await handler(
+      createReq('GET', {
+        lat: '38.46',
+        lon: '-93.53',
+        field_id: FIELD_ID,
+        asOf: '2026-03-17T14:37:00Z',
+      }),
+      mock.res
+    );
+    assert.equal(mock.status, 200);
+    assert.equal((mock.json.rain as Record<string, number>)['24h'], 0.75);
+    assert.equal((mock.json.sourceStatus as { database: string }).database, 'ok');
+  });
+
   it('returns 204 for OPTIONS preflight', async () => {
     const mock = createMockRes();
     await handler(createReq('OPTIONS', {}), mock.res);

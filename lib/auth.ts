@@ -112,15 +112,16 @@ export async function decideRainAccess(args: {
   if (!fieldId) return deny(400, 'field_id required', 'field_id_required');
 
   try {
-    const profile = await supabase.from('profiles').select('farm_id').eq('id', userId).maybeSingle();
-    if (profile.error) return unavailable('lookup_failed');
-
-    const field = await supabase
-      .from('fields')
-      .select('id, farm_id, lat, lng, deleted_at')
-      .eq('id', fieldId)
-      .maybeSingle();
-    if (field.error) return unavailable('lookup_failed');
+    // Independent lookups: run together to conserve the 10s serverless budget.
+    const [profile, field] = await Promise.all([
+      supabase.from('profiles').select('farm_id').eq('id', userId).maybeSingle(),
+      supabase
+        .from('fields')
+        .select('id, farm_id, lat, lng, deleted_at')
+        .eq('id', fieldId)
+        .maybeSingle(),
+    ]);
+    if (profile.error || field.error) return unavailable('lookup_failed');
 
     const farmId = (profile.data as { farm_id?: string | null } | null)?.farm_id ?? null;
     const fieldRow = (field.data as FieldAccessRow | null) ?? null;

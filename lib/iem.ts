@@ -256,11 +256,19 @@ async function fetchIemCustomRangeImpl(
   endDate: string,
   timeoutMs = 8000
 ): Promise<CustomRangeRadarResult> {
-  const requestedDates = enumerateDates(startDate, endDate);
-  const radarDates =
-    requestedDates.length > IEM_RADAR_RECENT_DAYS
-      ? requestedDates.slice(requestedDates.length - IEM_RADAR_RECENT_DAYS)
-      : requestedDates;
+  // Only enumerate the most recent IEM_RADAR_RECENT_DAYS: a huge start_date (e.g. year 0001)
+  // must not allocate millions of date strings.
+  const totalDays = Math.floor(
+    (Date.parse(`${endDate}T00:00:00Z`) - Date.parse(`${startDate}T00:00:00Z`)) / 86_400_000
+  ) + 1;
+  const radarStart =
+    totalDays > IEM_RADAR_RECENT_DAYS
+      ? new Date(Date.parse(`${endDate}T00:00:00Z`) - (IEM_RADAR_RECENT_DAYS - 1) * 86_400_000)
+          .toISOString()
+          .split('T')[0]
+      : startDate;
+  const radarDates = enumerateDates(radarStart, endDate);
+  const requestedDayCount = Math.max(totalDays, 0);
 
   const fetchResult = await fetchIemMultipleDays(lat, lon, radarDates, timeoutMs);
   let total = 0;
@@ -269,7 +277,7 @@ async function fetchIemCustomRangeImpl(
   });
 
   const dateRangePartial =
-    radarDates.length < requestedDates.length ||
+    radarDates.length < requestedDayCount ||
     radarDates[0] !== startDate ||
     radarDates[radarDates.length - 1] !== endDate;
 

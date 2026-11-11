@@ -61,9 +61,11 @@ function methodNotAllowed(res: VercelResponse) {
 
 function setCacheControl(
   res: VercelResponse,
-  options: { fieldId?: string; customRange?: boolean }
+  options: { fieldId?: string; customRange?: boolean; authRequired?: boolean }
 ) {
-  if (options.fieldId || options.customRange) {
+  // When login is enforced, a shared CDN cache would hand authenticated responses to anonymous callers.
+  if (options.fieldId || options.customRange || options.authRequired) {
+    res.setHeader('Vary', 'Authorization');
     res.setHeader('Cache-Control', 'private, no-store');
   } else {
     res.setHeader('Cache-Control', 's-maxage=300, stale-while-revalidate=60');
@@ -93,6 +95,53 @@ async function fetchDbTotal(
   if (error) return { total: 0, ok: false };
   const row = Array.isArray(data) ? data[0] : data;
   return { total: Number(row?.total_inches || 0), ok: true };
+}
+
+/**
+ * Exact rolling windows from field_rainfall_hourly. Hour keys follow the radar convention:
+ * a row stamped at periodEnd - i hours belongs to every window longer than i hours.
+ * Returns ok:false on any failure so the caller can fall back to the RPC.
+ */
+async function fetchDbWindows(
+  supabase: SupabaseClient,
+  fieldId: string,
+  periodEndUtc: Date
+): Promise<{ ok: true; totals: { '24h': number; '72h': number; '168h': number } } | { ok: false }> {
+  try {
+    const endMs = periodEndUtc.getTime();
+    const { data, error } = await supabase
+      .from('field_rainfall_hourly')
+      .select('timestamp_utc, rainfall_in')
+      .eq('field_id', fieldId)
+      .gt('timestamp_utc', new Date(endMs - 168 * 3_600_000).toISOString())
+      .lte('timestamp_utc', periodEndUtc.toISOString())
+      .or('finalized.eq.true,source.eq."Pass 2"');
+
+    if (error || !Array.isArray(data)) return { ok: false };
+
+    const totals = { '24h': 0, '72h': 0, '168h': 0 };
+    for (const row of data as Array<{ timestamp_utc: string; rainfall_in: number | string | null }>) {
+      const ts = Date.parse(row.timestamp_utc);
+      const value = Number(row.rainfall_in);
+      if (!Number.isFinite(ts) || !Number.isFinite(value) || value < 0) continue;
+      const ageHours = Math.round((endMs - ts) / 3_600_000);
+      if (ageHours < 0 || ageHours >= 168) continue;
+      totals['168h'] += value;
+      if (ageHours < 72) totals['72h'] += value;
+      if (ageHours < 24) totals['24h'] += value;
+    }
+
+    return {
+      ok: true,
+      totals: {
+        '24h': Number(totals['24h'].toFixed(3)),
+        '72h': Number(totals['72h'].toFixed(3)),
+        '168h': Number(totals['168h'].toFixed(3)),
+      },
+    };
+  } catch {
+    return { ok: false };
+  }
 }
 
 function combineWarnings(...parts: Array<string | undefined>): string | undefined {
@@ -343,7 +392,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         warnings.push('Radar data was unavailable; using historical database totals.');
       }
 
-      setCacheControl(res, { fieldId, customRange: true });
+      setCacheControl(res, { fieldId, customRange: true, authRequired: authMode === 'enforce' });
       return res.status(200).json({
         location: {
           type,
@@ -367,7 +416,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     let iemTotals: ReturnType<typeof aggregateRain> | null = null;
 
     let radarDataWarning: string | undefined;
-    if (lat !== undefined && lon !== undefined) {
+    let dbTotals = { '24h': 0, '72h': 0, '168h': 0 };
+    let dbConfigured = true;
+
+    // Radar and database are independent: fetch them concurrently so a slow radar (8s timeout)
+    // cannot push the database lookups past Vercel's 10s function limit.
+    const radarTask = async () => {
+      if (lat === undefined || lon === undefined) return;
       try {
         const dates = getRequiredDates(keys);
         const iemResult = await fetchIemMultipleDays(lat, lon, dates);
@@ -381,39 +436,54 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           throw err;
         }
       }
-    }
+    };
 
-    let dbTotals = { '24h': 0, '72h': 0, '168h': 0 };
-    if (fieldId) {
+    const dbTask = async () => {
+      if (!fieldId) return;
       const supabase = getSupabase();
       if (!supabase) {
-        if (sourceStatus.radar !== 'ok') {
-          return res.status(502).json({
-            error: 'Upstream data unavailable',
-            detail: 'Database is not configured and radar data is unavailable.',
-            retryAfterSeconds: 60,
-          });
-        }
-      } else {
-        const date24h = new Date(periodEndUtc.getTime() - 1 * 86_400_000).toISOString().split('T')[0];
-        const date72h = new Date(periodEndUtc.getTime() - 3 * 86_400_000).toISOString().split('T')[0];
-        const date168h = new Date(periodEndUtc.getTime() - 7 * 86_400_000).toISOString().split('T')[0];
-
-        const [sum24, sum72, sum168] = await Promise.all([
-          fetchDbTotal(fieldId, date24h, endDate),
-          fetchDbTotal(fieldId, date72h, endDate),
-          fetchDbTotal(fieldId, date168h, endDate),
-        ]);
-
-        if (sum24.ok && sum72.ok && sum168.ok) {
-          sourceStatus.database = 'ok';
-          dbTotals = {
-            '24h': sum24.total,
-            '72h': sum72.total,
-            '168h': sum168.total,
-          };
-        }
+        dbConfigured = false;
+        return;
       }
+      // Preferred: exact hourly windows (same rows and finalized filter as get_rainfall_stats).
+      const hourly = await fetchDbWindows(supabase, fieldId, periodEndUtc);
+      if (hourly.ok) {
+        sourceStatus.database = 'ok';
+        dbTotals = hourly.totals;
+        return;
+      }
+
+      // Fallback: calendar-day RPC totals (can span more than the nominal window).
+      const date24h = new Date(periodEndUtc.getTime() - 1 * 86_400_000).toISOString().split('T')[0];
+      const date72h = new Date(periodEndUtc.getTime() - 3 * 86_400_000).toISOString().split('T')[0];
+      const date168h = new Date(periodEndUtc.getTime() - 7 * 86_400_000).toISOString().split('T')[0];
+
+      const [sum24, sum72, sum168] = await Promise.all([
+        fetchDbTotal(fieldId, date24h, endDate),
+        fetchDbTotal(fieldId, date72h, endDate),
+        fetchDbTotal(fieldId, date168h, endDate),
+      ]);
+
+      if (sum24.ok && sum72.ok && sum168.ok) {
+        sourceStatus.database = 'ok';
+        dbTotals = {
+          '24h': sum24.total,
+          '72h': sum72.total,
+          '168h': sum168.total,
+        };
+      }
+    };
+
+    await Promise.all([radarTask(), dbTask()]);
+    // TS cannot see assignments made inside the task closures above.
+    const radarTotals = iemTotals as ReturnType<typeof aggregateRain> | null;
+
+    if (fieldId && !dbConfigured && sourceStatus.radar !== 'ok') {
+      return res.status(502).json({
+        error: 'Upstream data unavailable',
+        detail: 'Database is not configured and radar data is unavailable.',
+        retryAfterSeconds: 60,
+      });
     }
 
     if (sourceStatus.radar !== 'ok' && sourceStatus.database !== 'ok') {
@@ -432,7 +502,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       });
     }
 
-    const iem = iemTotals || {
+    const iem = radarTotals || {
       '12h': { inches: 0 },
       '24h': { inches: 0 },
       '72h': { inches: 0 },
@@ -463,7 +533,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     const warnings: string[] = [];
     if (radarDataWarning) warnings.push(radarDataWarning);
-    if (iemTotals?.dataWarning) warnings.push(iemTotals.dataWarning);
+    if (radarTotals?.dataWarning) warnings.push(radarTotals.dataWarning);
     if (sourceStatus.radar === 'ok' && sourceStatus.database === 'unavailable' && fieldId) {
       warnings.push('Historical database data was unavailable; using radar totals.');
     }
@@ -480,7 +550,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       );
     }
 
-    setCacheControl(res, { fieldId });
+    setCacheControl(res, { fieldId, authRequired: authMode === 'enforce' });
 
     return res.status(200).json({
       location: {
@@ -500,6 +570,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       sourceStatus,
     });
   } catch (err: unknown) {
+    // Vercel throws a 400-tagged error when the JSON body cannot be parsed.
+    if ((err as { statusCode?: number } | null)?.statusCode === 400) {
+      return badRequest(res, 'Invalid request body', 'Request body must be valid JSON.');
+    }
     console.error('Rain API Error:', err);
     return res.status(500).json({
       error: 'Internal Server Error',

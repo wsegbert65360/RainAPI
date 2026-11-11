@@ -87,6 +87,12 @@ npm run typecheck
 
 Push to `main` branch for automatic Vercel deployment. Field ID mode needs `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` in the Vercel project settings. Leave `RAIN_API_AUTH` unset so the access gate stays `off` until the deploy order below.
 
+## Security notes
+
+- `.env.vercel` (Vercel CLI `VERCEL_OIDC_TOKEN`) was committed in early history. The token **expired on 2026-03-28** and the file is now untracked and gitignored. Refresh with `vercel env pull`; never commit `.env*` files.
+- With `RAIN_API_AUTH` unset (`off`) the API is open, and it reads Supabase with the service-role key, so anyone holding a field UUID can read that field's rainfall. Roll out the gate (below) when ready.
+- Rolling-window database totals are exact-hour sums of `field_rainfall_hourly` (finalized or Pass 2 rows), with the `get_rainfall_stats` RPC as fallback.
+
 ## Access gate (RAIN_API_AUTH)
 
 AcreLedger's free tier does not use this API for hourly rainfall. Free farms read daily totals from AcreLedger's own database. Pro and complimentary farms may use this API, and so may every farm while the app's `ENTITLEMENTS_MODE` is not `enforce`. The gate stays off until you set it. Unset or any value other than `log` or `enforce` means `off`.
