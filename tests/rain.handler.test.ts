@@ -684,6 +684,7 @@ interface AuthFake {
   fieldMissing?: boolean;
   allowed?: boolean | null;
   rpcError?: boolean;
+  plan?: string;
   throwOnAuth?: boolean;
 }
 
@@ -729,6 +730,8 @@ function authFake(f: AuthFake = {}) {
           ? { data: null, error: { message: 'rpc down' } }
           : { data: f.allowed ?? true, error: null };
       }
+      if (name === 'entitlements_mode') return { data: 'enforce', error: null };
+      if (name === '_farm_entitlement') return { data: [{ plan: f.plan ?? 'paid' }], error: null };
       return { data: [{ total_inches: 0.4 }], error: null };
     },
   };
@@ -826,27 +829,30 @@ describe('rain handler access gate', () => {
     assert.deepEqual(mock.json, { error: 'Sign in required' });
   });
 
-  it('enforce: 400 when the request has coordinates but no field_id', async () => {
+  it('enforce: serves a GPS-only request for a paid farm and denies a free farm', async () => {
     process.env.RAIN_API_AUTH = 'enforce';
-    __test_setSupabase(authFake({ allowed: true }) as never);
-    const mock = createMockRes();
-    await handler(
-      createReq(
-        'GET',
-        { lat: '38.46', lon: '-93.53', asOf: '2026-03-17T14:37:00Z' },
-        undefined,
-        { authorization: AUTH_TOKEN }
-      ),
-      mock.res
-    );
-    assert.equal(mock.status, 400);
-    assert.deepEqual(mock.json, { error: 'field_id required' });
+    for (const [plan, status] of [['paid', 200], ['free', 403]] as const) {
+      __test_setSupabase(authFake({ plan }) as never);
+      const mock = createMockRes();
+      await handler(
+        createReq(
+          'GET',
+          { lat: '38.46', lon: '-93.53', asOf: '2026-03-17T14:37:00Z' },
+          undefined,
+          { authorization: AUTH_TOKEN }
+        ),
+        mock.res
+      );
+      assert.equal(mock.status, status);
+      if (status === 403) assert.deepEqual(mock.json, { error: 'premium_required:rainfall' });
+    }
   });
 
-  it('enforce: 400 for a polygon with no field_id', async () => {
+  it('enforce: serves a boundary-only request for a paid farm and denies a free farm', async () => {
     process.env.RAIN_API_AUTH = 'enforce';
-    __test_setSupabase(authFake({ allowed: true }) as never);
-    const mock = createMockRes();
+    for (const [plan, status] of [['paid', 200], ['free', 403]] as const) {
+      __test_setSupabase(authFake({ plan }) as never);
+      const mock = createMockRes();
     await handler(
       createReq(
         'POST',
@@ -864,8 +870,8 @@ describe('rain handler access gate', () => {
       ),
       mock.res
     );
-    assert.equal(mock.status, 400);
-    assert.deepEqual(mock.json, { error: 'field_id required' });
+      assert.equal(mock.status, status);
+    }
   });
 
   it('enforce: 403 when the field belongs to another farm', async () => {

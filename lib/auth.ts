@@ -7,9 +7,11 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 //   RAIN_API_AUTH=enforce  apply the decision. Fail closed: a Supabase or lookup failure is a 503,
 //                          never a served rainfall total.
 //
-// Enforce requires a Supabase bearer token, a field_id that belongs to the caller's farm and is not
-// soft-deleted, request coordinates within FIELD_MATCH_RADIUS_KM of the field's stored lat/lng
-// (or the stored point when the request has none), and rainfall_field_hourly_allowed(p_field_id).
+// Enforce requires a Supabase bearer token and one of:
+//   * a field_id that belongs to the caller's farm and is not soft-deleted, request coordinates within
+//     FIELD_MATCH_RADIUS_KM of the field's stored lat/lng (or the stored point when the request has none),
+//     and rainfall_field_hourly_allowed(p_field_id); or
+//   * no field_id (a GPS point or a drawn boundary): a farm for the caller that is not on the free plan.
 // Do not log tokens or secrets. The handler logs only the denial reason.
 
 export type RainAuthMode = 'off' | 'log' | 'enforce';
@@ -83,6 +85,43 @@ function readStoredCoordinate(value: unknown, kind: 'lat' | 'lng'): number | nul
   return parsed;
 }
 
+// A GPS point or a drawn boundary (the handler turns it into a centroid) with no saved field. There is no
+// field row to match, so there is no field or distance check: the caller must be signed in, belong to a
+// farm, and that farm must not be on the free plan (the same plan rule rainfall_field_hourly_allowed uses).
+// Fail closed on any lookup error.
+async function decideLocationOnlyAccess(
+  supabase: SupabaseClient,
+  userId: string,
+  lat: number | undefined,
+  lon: number | undefined
+): Promise<RainAuthDecision> {
+  if (lat === undefined || lon === undefined || !Number.isFinite(lat) || !Number.isFinite(lon)) {
+    return deny(400, 'Location required', 'location_required');
+  }
+
+  try {
+    const profile = await supabase.from('profiles').select('farm_id').eq('id', userId).maybeSingle();
+    if (profile.error) return unavailable('lookup_failed');
+    const farmId = (profile.data as { farm_id?: string | null } | null)?.farm_id ?? null;
+    if (!farmId) return deny(403, 'Farm not found for this user', 'no_farm');
+
+    const mode = await supabase.rpc('entitlements_mode');
+    if (mode.error || typeof mode.data !== 'string') return unavailable('lookup_failed');
+    if (mode.data !== 'enforce') return { allow: true, reason: 'location_only' };
+
+    const entitlement = await supabase.rpc('_farm_entitlement', { p_farm_id: farmId });
+    if (entitlement.error) return unavailable('lookup_failed');
+    const row = Array.isArray(entitlement.data) ? entitlement.data[0] : entitlement.data;
+    const plan = (row as { plan?: unknown } | null | undefined)?.plan;
+    if (typeof plan !== 'string') return unavailable('lookup_failed');
+    if (plan === 'free') return deny(403, 'premium_required:rainfall', 'premium_required');
+
+    return { allow: true, reason: 'location_only' };
+  } catch {
+    return unavailable('lookup_failed');
+  }
+}
+
 export async function decideRainAccess(args: {
   supabase: SupabaseClient | null;
   authorization: unknown;
@@ -109,7 +148,7 @@ export async function decideRainAccess(args: {
     return unavailable('auth_unavailable');
   }
 
-  if (!fieldId) return deny(400, 'field_id required', 'field_id_required');
+  if (!fieldId) return decideLocationOnlyAccess(supabase, userId, lat, lon);
 
   try {
     // Independent lookups: run together to conserve the 10s serverless budget.

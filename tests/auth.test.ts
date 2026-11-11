@@ -23,6 +23,8 @@ interface Fake {
   fieldError?: boolean;
   allowed?: boolean | null;
   rpcError?: boolean;
+  mode?: string | null;
+  plan?: string | null;
   throwOnAuth?: boolean;
   throwOnLookup?: boolean;
 }
@@ -78,6 +80,16 @@ function fakeSupabase(f: Fake) {
       if (name === 'rainfall_field_hourly_allowed') {
         return f.rpcError ? { data: null, error: { message: 'rpc down' } } : { data: f.allowed ?? true, error: null };
       }
+      if (name === 'entitlements_mode') {
+        return f.rpcError
+          ? { data: null, error: { message: 'rpc down' } }
+          : { data: f.mode === undefined ? 'enforce' : f.mode, error: null };
+      }
+      if (name === '_farm_entitlement') {
+        return f.rpcError
+          ? { data: null, error: { message: 'rpc down' } }
+          : { data: f.plan === null ? [] : [{ plan: f.plan ?? 'paid' }], error: null };
+      }
       return { data: [{ total_inches: 0.4 }], error: null };
     },
   };
@@ -131,18 +143,60 @@ describe('rain auth helpers', () => {
     assert.equal(!rejected.allow && rejected.reason, 'invalid_token');
   });
 
-  it('requires field_id after a valid login', async () => {
-    const missing = await decideRainAccess({
-      supabase: fakeSupabase({}) as never,
-      authorization: 'Bearer tok',
-      lat: FIELD_LAT,
-      lon: FIELD_LNG,
+  describe('location only (GPS point or boundary centroid, no field_id)', () => {
+    // Call decideRainAccess directly: decide() turns an undefined fieldId into its default field.
+    const noField = (
+      f: Fake,
+      point: { lat?: number; lon?: number } = { lat: FIELD_LAT, lon: FIELD_LNG },
+      authorization: unknown = 'Bearer tok'
+    ) =>
+      decideRainAccess({
+        supabase: fakeSupabase(f) as never,
+        authorization,
+        lat: point.lat,
+        lon: point.lon,
+      });
+
+    it('allows a signed-in farm on a paid plan, with no field or distance check', async () => {
+      const far = await noField({ plan: 'paid' }, { lat: 10, lon: 10 });
+      assert.deepEqual(far, { allow: true, reason: 'location_only' });
+      const comped = await noField({ plan: 'complimentary' });
+      assert.equal(comped.allow, true);
     });
-    assert.deepEqual(missing, {
-      allow: false,
-      status: 400,
-      error: 'field_id required',
-      reason: 'field_id_required',
+
+    it('denies a free-plan farm in enforce mode', async () => {
+      const d = await noField({ plan: 'free' });
+      assert.deepEqual(d, {
+        allow: false,
+        status: 403,
+        error: 'premium_required:rainfall',
+        reason: 'premium_required',
+      });
+    });
+
+    it('allows any signed-in farm when entitlements mode is not enforce', async () => {
+      assert.equal((await noField({ mode: 'off', plan: 'free' })).allow, true);
+      assert.equal((await noField({ mode: 'shadow', plan: 'free' })).allow, true);
+    });
+
+    it('requires a location, a farm, and fails closed on lookup problems', async () => {
+      const noPoint = await noField({}, {});
+      assert.equal(!noPoint.allow && noPoint.status, 400);
+      assert.equal(!noPoint.allow && noPoint.reason, 'location_required');
+
+      const noFarm = await noField({ profileFarm: null });
+      assert.equal(!noFarm.allow && noFarm.status, 403);
+      assert.equal(!noFarm.allow && noFarm.reason, 'no_farm');
+
+      for (const f of [{ rpcError: true }, { profileError: true }, { plan: null }, { mode: null }] as Fake[]) {
+        const d = await noField(f);
+        assert.equal(!d.allow && d.status, 503);
+      }
+    });
+
+    it('still needs a valid login', async () => {
+      const d = await noField({}, { lat: FIELD_LAT, lon: FIELD_LNG }, null);
+      assert.equal(!d.allow && d.status, 401);
     });
   });
 
@@ -390,13 +444,30 @@ describe('rain handler auth modes', () => {
     assert.deepEqual(m.json, { error: 'Sign in required' });
   });
 
-  it('enforce: 400 for coordinate-only and polygon-only requests', async () => {
+  it('enforce: serves coordinate-only and polygon-only requests for a paid farm', async () => {
     process.env.RAIN_API_AUTH = 'enforce';
-    __test_setSupabase(fakeSupabase({ allowed: true }) as never);
+    __test_setSupabase(fakeSupabase({ plan: 'paid' }) as never);
     let m = mockRes();
     await handler(req({ lat: '38.46', lon: '-93.53', asOf: '2026-03-17T14:37:00Z' }, TOKEN), m.res);
-    assert.equal(m.status, 400);
-    assert.deepEqual(m.json, { error: 'field_id required' });
+    assert.equal(m.status, 200);
+
+    m = mockRes();
+    await handler(
+      req({ asOf: '2026-03-17T14:37:00Z' }, TOKEN, {
+        polygon: [[-93.54, 38.45], [-93.52, 38.45], [-93.52, 38.47], [-93.54, 38.47], [-93.54, 38.45]],
+      }),
+      m.res
+    );
+    assert.equal(m.status, 200);
+  });
+
+  it('enforce: 403 for coordinate-only and polygon-only requests on a free farm', async () => {
+    process.env.RAIN_API_AUTH = 'enforce';
+    __test_setSupabase(fakeSupabase({ plan: 'free' }) as never);
+    let m = mockRes();
+    await handler(req({ lat: '38.46', lon: '-93.53', asOf: '2026-03-17T14:37:00Z' }, TOKEN), m.res);
+    assert.equal(m.status, 403);
+    assert.deepEqual(m.json, { error: 'premium_required:rainfall' });
 
     m = mockRes();
     await handler(
@@ -405,8 +476,7 @@ describe('rain handler auth modes', () => {
       }),
       m.res
     );
-    assert.equal(m.status, 400);
-    assert.deepEqual(m.json, { error: 'field_id required' });
+    assert.equal(m.status, 403);
   });
 
   it('enforce: 403 for another farm, a soft-deleted field, and coordinates beyond 10 km', async () => {
