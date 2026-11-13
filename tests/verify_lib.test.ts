@@ -115,3 +115,18 @@ test('iem custom range: short span is requested in full', async () => {
     __test_resetIemMocks();
   }
 });
+
+test('iem coverage warning: a UTC day that just started is not reported as missing', async () => {
+  const { partialCoverageWarning } = await import('../lib/iem');
+  const justAfterMidnight = new Date('2026-11-13T00:10:00Z');
+  assert.equal(partialCoverageWarning(['2026-11-13'], justAfterMidnight), undefined);
+  assert.equal(
+    partialCoverageWarning(['2026-11-11', '2026-11-13'], justAfterMidnight),
+    'Radar data unavailable for 1 day(s): 2026-11-11.',
+  );
+  const laterThatDay = new Date('2026-11-13T05:00:00Z');
+  assert.equal(
+    partialCoverageWarning(['2026-11-13'], laterThatDay),
+    'Radar data unavailable for 1 day(s): 2026-11-13.',
+  );
+});

@@ -125,9 +125,15 @@ function parseIemDayPayload(json: unknown): Map<string, number> {
   return hourMap;
 }
 
-function partialCoverageWarning(failedDates: string[]): string | undefined {
-  if (failedDates.length === 0) return undefined;
-  return `Radar data unavailable for ${failedDates.length} day(s): ${failedDates.join(', ')}.`;
+/** IEM publishes a UTC day's first hours with a lag; an empty day this young is not missing data. */
+export const IEM_NEW_DAY_GRACE_HOURS = 3;
+
+export function partialCoverageWarning(failedDates: string[], now: Date = new Date()): string | undefined {
+  const todayUtc = now.toISOString().slice(0, 10);
+  const inGrace = now.getUTCHours() < IEM_NEW_DAY_GRACE_HOURS;
+  const missing = failedDates.filter((date) => !(inGrace && date >= todayUtc));
+  if (missing.length === 0) return undefined;
+  return `Radar data unavailable for ${missing.length} day(s): ${missing.join(', ')}.`;
 }
 
 async function fetchSingleDay(
