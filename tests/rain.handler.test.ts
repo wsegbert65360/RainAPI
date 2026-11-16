@@ -12,6 +12,57 @@ import {
 import { generateHourKeys } from '../lib/time';
 
 const FIELD_ID = '11111111-1111-4111-8111-111111111111';
+const DATA_TOKEN = 'Bearer test-token';
+
+// Rainfall behavior tests send a signed-in caller. Auth RPCs stay allow; rainfall RPCs delegate.
+function allowingAuth(inner: {
+  from?: (table: string) => unknown;
+  rpc?: (name: string, args?: unknown) => Promise<unknown>;
+} = {}) {
+  return {
+    auth: {
+      getUser: async () => ({ data: { user: { id: 'u1' } }, error: null }),
+    },
+    from: (table: string) => {
+      if (table === 'profiles') {
+        return {
+          select: () => ({
+            eq: () => ({
+              maybeSingle: async () => ({ data: { farm_id: 'farm-a' }, error: null }),
+            }),
+          }),
+        };
+      }
+      if (table === 'fields') {
+        return {
+          select: () => ({
+            eq: () => ({
+              maybeSingle: async () => ({
+                data: {
+                  id: FIELD_ID,
+                  farm_id: 'farm-a',
+                  lat: 38.46,
+                  lng: -93.53,
+                  deleted_at: null,
+                },
+                error: null,
+              }),
+            }),
+          }),
+        };
+      }
+      if (inner.from) return inner.from(table);
+      throw new Error(`no query stub for ${table}`);
+    },
+    rpc: async (name: string, args?: unknown) => {
+      if (name === 'rainfall_field_hourly_allowed') return { data: true, error: null };
+      if (name === 'entitlements_mode') return { data: 'off', error: null };
+      if (name === '_farm_entitlement') return { data: [{ plan: 'paid' }], error: null };
+      if (inner.rpc) return inner.rpc(name, args);
+      return { data: null, error: { message: 'rpc not stubbed' } };
+    },
+  };
+}
 
 function createMockRes() {
   const headers: Record<string, string> = {};
@@ -59,7 +110,7 @@ function createReq(
     method,
     query,
     body,
-    headers,
+    headers: headers ?? { authorization: DATA_TOKEN },
   } as VercelRequest;
 }
 
@@ -164,21 +215,21 @@ function mockPartialRadarCoverage() {
 }
 
 function mockDbSuccess() {
-  __test_setSupabase({
+  __test_setSupabase(allowingAuth({
     rpc: async () => ({
       data: [{ total_inches: 0.75 }],
       error: null,
     }),
-  } as never);
+  }) as never);
 }
 
 function mockDbFailure() {
-  __test_setSupabase({
+  __test_setSupabase(allowingAuth({
     rpc: async () => ({
       data: null,
       error: { message: 'db down' },
     }),
-  } as never);
+  }) as never);
 }
 
 describe('rain handler', () => {
@@ -187,6 +238,7 @@ describe('rain handler', () => {
     __test_resetSupabase();
     process.env.SUPABASE_URL = 'https://example.supabase.co';
     process.env.SUPABASE_SERVICE_ROLE_KEY = 'service-role-key';
+    __test_setSupabase(allowingAuth() as never);
     mockRadarSuccess();
   });
 
@@ -206,7 +258,9 @@ describe('rain handler', () => {
     assert.equal(typeof mock.json.rainMm, 'object');
     assert.equal(typeof mock.json.periodEndUtc, 'string');
     assert.equal(mock.json.periodEndUtc, '2026-03-17T14:00:00.000Z');
-    assert.match(mock.headers['cache-control'] || '', /s-maxage=300/);
+    assert.equal(mock.headers['cache-control'], 'private, no-store');
+    assert.equal(mock.headers.vary, 'Authorization');
+    assert.match(mock.headers['access-control-allow-headers'] || '', /Authorization/);
   });
 
   it('accepts latitude equal to zero', async () => {
@@ -235,6 +289,7 @@ describe('rain handler', () => {
     );
     assert.equal(mock.status, 200);
     assert.equal(mock.headers['cache-control'], 'private, no-store');
+    assert.equal(mock.headers.vary, 'Authorization');
     assert.equal((mock.json.sourceStatus as { database: string }).database, 'ok');
   });
 
@@ -257,12 +312,12 @@ describe('rain handler', () => {
   });
 
   it('preserves the database total when it exceeds the radar total', async () => {
-    __test_setSupabase({
+    __test_setSupabase(allowingAuth({
       rpc: async () => ({
         data: [{ total_inches: 2.5 }],
         error: null,
       }),
-    } as never);
+    }) as never);
     const mock = createMockRes();
     await handler(
       createReq('GET', {
@@ -604,10 +659,10 @@ describe('rain handler', () => {
     const chain: Record<string, unknown> = {};
     for (const m of ['select', 'eq', 'gt', 'lte', 'or']) chain[m] = () => chain;
     chain.then = (resolve: (v: unknown) => void) => resolve({ data: rows, error: null });
-    __test_setSupabase({
+    __test_setSupabase(allowingAuth({
       from: () => chain,
       rpc: async () => ({ data: [{ total_inches: 99 }], error: null }),
-    } as never);
+    }) as never);
   }
 
   it('sums database rain over exact hourly windows, not calendar days', async () => {
@@ -643,10 +698,10 @@ describe('rain handler', () => {
     const chain: Record<string, unknown> = {};
     for (const m of ['select', 'eq', 'gt', 'lte', 'or']) chain[m] = () => chain;
     chain.then = (resolve: (v: unknown) => void) => resolve({ data: null, error: { message: 'boom' } });
-    __test_setSupabase({
+    __test_setSupabase(allowingAuth({
       from: () => chain,
       rpc: async () => ({ data: [{ total_inches: 0.75 }], error: null }),
-    } as never);
+    }) as never);
     const mock = createMockRes();
     await handler(
       createReq('GET', {
@@ -666,6 +721,7 @@ describe('rain handler', () => {
     const mock = createMockRes();
     await handler(createReq('OPTIONS', {}), mock.res);
     assert.equal(mock.status, 204);
+    assert.match(mock.headers['access-control-allow-headers'] || '', /Authorization/);
   });
 });
 
@@ -780,36 +836,73 @@ describe('rain handler access gate', () => {
     delete process.env.SUPABASE_SERVICE_ROLE_KEY;
   });
 
-  it('off mode is unchanged for a coordinate-only request', async () => {
-    let authCalls = 0;
-    __test_setSupabase({
-      auth: {
-        getUser: async () => {
-          authCalls += 1;
-          throw new Error('should not run');
+  it('unset, off, log, and unknown modes refuse stored totals without a token', async () => {
+    for (const mode of ['unset', 'off', 'log', 'enforce', 'garbage'] as const) {
+      if (mode === 'unset') delete process.env.RAIN_API_AUTH;
+      else process.env.RAIN_API_AUTH = mode;
+
+      let reads = 0;
+      __test_setSupabase({
+        auth: {
+          getUser: async () => {
+            throw new Error('should not run without a token');
+          },
         },
-      },
-      from() {
-        throw new Error('should not run');
-      },
-      rpc: async () => {
-        throw new Error('should not run');
-      },
-    } as never);
-    const warn = captureAuthWarnings();
-    try {
-      const mock = createMockRes();
+        from() {
+          reads += 1;
+          throw new Error('should not read rainfall');
+        },
+        rpc: async () => {
+          reads += 1;
+          return { data: [{ total_inches: 9 }], error: null };
+        },
+      } as never);
+
+      const custom = createMockRes();
       await handler(
-        createReq('GET', { lat: '38.46', lon: '-93.53', asOf: '2026-03-17T14:37:00Z' }),
-        mock.res
+        createReq(
+          'GET',
+          { field_id: FIELD_ID, start_date: '2026-03-01', end_date: '2026-03-17' },
+          undefined,
+          {}
+        ),
+        custom.res
       );
-      assert.equal(mock.status, 200);
-      assert.equal(typeof (mock.json.rain as Record<string, number>)['24h'], 'number');
-      assert.equal(authCalls, 0);
-      assert.equal(warn.denials().length, 0);
-    } finally {
-      warn.restore();
+      assert.equal(custom.status, 401, mode);
+      assert.deepEqual(custom.json, { error: 'Sign in required' });
+      assert.match(custom.headers['access-control-allow-headers'] || '', /Authorization/);
+
+      const rolling = createMockRes();
+      await handler(
+        createReq(
+          'GET',
+          { lat: '38.46', lon: '-93.53', field_id: FIELD_ID, asOf: '2026-03-17T14:37:00Z' },
+          undefined,
+          {}
+        ),
+        rolling.res
+      );
+      assert.equal(rolling.status, 401, mode);
+      assert.equal(rolling.json.rain, undefined);
+      assert.equal(reads, 0, mode);
     }
+  });
+
+  it('returns 401 for an invalid token and does not serve field totals', async () => {
+    delete process.env.RAIN_API_AUTH;
+    __test_setSupabase(authFake({ user: null, userError: { status: 401 }, allowed: true }) as never);
+    const mock = createMockRes();
+    await handler(
+      createReq(
+        'GET',
+        { lat: '38.46', lon: '-93.53', field_id: FIELD_ID, asOf: '2026-03-17T14:37:00Z' },
+        undefined,
+        { authorization: 'Bearer not-a-user' }
+      ),
+      mock.res
+    );
+    assert.equal(mock.status, 401);
+    assert.deepEqual(mock.json, { error: 'Sign in required' });
   });
 
   it('enforce: 401 when the bearer token is missing', async () => {
@@ -817,12 +910,17 @@ describe('rain handler access gate', () => {
     __test_setSupabase(authFake({ allowed: true }) as never);
     const mock = createMockRes();
     await handler(
-      createReq('GET', {
-        lat: '38.46',
-        lon: '-93.53',
-        field_id: FIELD_ID,
-        asOf: '2026-03-17T14:37:00Z',
-      }),
+      createReq(
+        'GET',
+        {
+          lat: '38.46',
+          lon: '-93.53',
+          field_id: FIELD_ID,
+          asOf: '2026-03-17T14:37:00Z',
+        },
+        undefined,
+        {}
+      ),
       mock.res
     );
     assert.equal(mock.status, 401);
@@ -944,27 +1042,32 @@ describe('rain handler access gate', () => {
     assert.equal((mock.json.location as { fieldId?: string }).fieldId, FIELD_ID);
   });
 
-  it('enforce: 503 when Supabase is not configured', async () => {
-    process.env.RAIN_API_AUTH = 'enforce';
-    delete process.env.SUPABASE_URL;
-    delete process.env.SUPABASE_SERVICE_ROLE_KEY;
-    __test_resetSupabase();
-    const mock = createMockRes();
-    await handler(
-      createReq(
-        'GET',
-        { lat: '38.46', lon: '-93.53', field_id: FIELD_ID, asOf: '2026-03-17T14:37:00Z' },
-        undefined,
-        { authorization: AUTH_TOKEN }
-      ),
-      mock.res
-    );
-    assert.equal(mock.status, 503);
-    assert.deepEqual(mock.json, { error: 'Rainfall access check unavailable' });
+  it('returns 503 and no rainfall when Supabase is not configured', async () => {
+    for (const mode of ['unset', 'off', 'log', 'enforce'] as const) {
+      if (mode === 'unset') delete process.env.RAIN_API_AUTH;
+      else process.env.RAIN_API_AUTH = mode;
+      delete process.env.SUPABASE_URL;
+      delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+      __test_resetSupabase();
+      const mock = createMockRes();
+      await handler(
+        createReq(
+          'GET',
+          { lat: '38.46', lon: '-93.53', field_id: FIELD_ID, asOf: '2026-03-17T14:37:00Z' },
+          undefined,
+          { authorization: AUTH_TOKEN }
+        ),
+        mock.res
+      );
+      assert.equal(mock.status, 503, mode);
+      assert.deepEqual(mock.json, { error: 'Rainfall access check unavailable' });
+    }
   });
 
-  it('enforce: 503 when the plan RPC errors', async () => {
-    process.env.RAIN_API_AUTH = 'enforce';
+  it('returns 503 and no rainfall when the plan RPC errors', async () => {
+    delete process.env.RAIN_API_AUTH;
+    process.env.SUPABASE_URL = 'https://example.supabase.co';
+    process.env.SUPABASE_SERVICE_ROLE_KEY = 'service-role-key';
     __test_setSupabase(authFake({ rpcError: true, allowed: true }) as never);
     const mock = createMockRes();
     await handler(
@@ -981,7 +1084,27 @@ describe('rain handler access gate', () => {
     assert.equal(mock.json.rain, undefined);
   });
 
-  it('log mode serves a coordinate request when Supabase is not configured', async () => {
+  it('unset mode still serves a signed-in request for the caller\'s own field', async () => {
+    delete process.env.RAIN_API_AUTH;
+    __test_setSupabase(authFake({ allowed: true }) as never);
+    const mock = createMockRes();
+    await handler(
+      createReq(
+        'GET',
+        { lat: '38.46', lon: '-93.53', field_id: FIELD_ID, asOf: '2026-03-17T14:37:00Z' },
+        undefined,
+        { authorization: AUTH_TOKEN }
+      ),
+      mock.res
+    );
+    assert.equal(mock.status, 200);
+    assert.equal(typeof (mock.json.rain as Record<string, number>)['24h'], 'number');
+    assert.equal(mock.headers['cache-control'], 'private, no-store');
+    assert.equal(mock.headers.vary, 'Authorization');
+    assert.match(mock.headers['access-control-allow-headers'] || '', /Authorization/);
+  });
+
+  it('log mode returns 503 when Supabase is not configured and does not serve', async () => {
     process.env.RAIN_API_AUTH = 'log';
     delete process.env.SUPABASE_URL;
     delete process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -998,21 +1121,23 @@ describe('rain handler access gate', () => {
         ),
         mock.res
       );
-      assert.equal(mock.status, 200);
+      assert.equal(mock.status, 503);
+      assert.deepEqual(mock.json, { error: 'Rainfall access check unavailable' });
       assert.equal(warn.denials()[0]?.reason, 'auth_unavailable');
       assert.equal(warn.denials()[0]?.status, 503);
+      assert.equal(warn.denials()[0]?.mode, 'log');
       assert.equal(JSON.stringify(warn.lines).includes('super-secret-token'), false);
     } finally {
       warn.restore();
     }
   });
 
-  it('log mode does not replace a field-only custom range with stored coordinates', async () => {
+  it('log mode uses stored field coordinates for an allowed custom range', async () => {
     process.env.RAIN_API_AUTH = 'log';
-    let radarCalls = 0;
+    let seen: { lat?: number; lon?: number } = {};
     __test_setIemMocks({
-      fetchIemCustomRange: async () => {
-        radarCalls += 1;
+      fetchIemCustomRange: async (lat: number, lon: number) => {
+        seen = { lat, lon };
         return customRangeSuccessResult();
       },
     });
@@ -1028,11 +1153,12 @@ describe('rain handler access gate', () => {
       mock.res
     );
     assert.equal(mock.status, 200);
-    assert.equal(radarCalls, 0);
-    assert.equal((mock.json.rain as { total: number }).total, 0.4);
+    assert.equal(seen.lat, FIELD_LAT);
+    assert.equal(seen.lon, FIELD_LNG);
+    assert.equal((mock.json.rain as { total: number }).total, 1.25);
   });
 
-  it('log mode serves the request and logs the would-be denial', async () => {
+  it('log mode rejects the denial and logs it without the token', async () => {
     process.env.RAIN_API_AUTH = 'log';
     __test_setSupabase(authFake({ allowed: false }) as never);
     const warn = captureAuthWarnings();
@@ -1047,13 +1173,14 @@ describe('rain handler access gate', () => {
         ),
         mock.res
       );
-      assert.equal(mock.status, 200);
-      assert.equal(typeof (mock.json.rain as Record<string, number>)['24h'], 'number');
+      assert.equal(mock.status, 403);
+      assert.deepEqual(mock.json, { error: 'premium_required:rainfall' });
       const denial = warn.denials()[0];
       assert.equal(denial?.mode, 'log');
       assert.equal(denial?.reason, 'premium_required');
       assert.equal(denial?.fieldId, FIELD_ID);
       assert.equal(JSON.stringify(warn.lines).includes('super-secret-token'), false);
+      assert.equal(JSON.stringify(warn.lines).includes('service-role-key'), false);
     } finally {
       warn.restore();
     }

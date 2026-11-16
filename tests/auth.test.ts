@@ -116,12 +116,14 @@ function northOf(lat: number, lon: number, km: number): number {
 
 describe('rain auth helpers', () => {
   it('parses mode and bearer token', () => {
-    assert.equal(readRainAuthMode(undefined), 'off');
-    assert.equal(readRainAuthMode(''), 'off');
-    assert.equal(readRainAuthMode('garbage'), 'off');
-    assert.equal(readRainAuthMode('off'), 'off');
+    assert.equal(readRainAuthMode(undefined), 'enforce');
+    assert.equal(readRainAuthMode(''), 'enforce');
+    assert.equal(readRainAuthMode('garbage'), 'enforce');
+    assert.equal(readRainAuthMode('off'), 'enforce');
+    assert.equal(readRainAuthMode(' OFF '), 'enforce');
     assert.equal(readRainAuthMode(' Enforce '), 'enforce');
     assert.equal(readRainAuthMode('log'), 'log');
+    assert.equal(readRainAuthMode(' Log '), 'log');
     assert.equal(readBearerToken('Bearer abc'), 'abc');
     assert.equal(readBearerToken('bearer abc'), 'abc');
     assert.equal(readBearerToken(['Bearer abc']), 'abc');
@@ -381,35 +383,46 @@ describe('rain handler auth modes', () => {
     delete process.env.SUPABASE_SERVICE_ROLE_KEY;
   });
 
-  it('off: serves a coordinate-only request and does not run the gate', async () => {
-    let authCalls = 0;
-    __test_setSupabase({
-      auth: {
-        getUser: async () => {
-          authCalls += 1;
+  it('unset and off do not serve a field request without a token', async () => {
+    for (const raw of [undefined, 'off', 'garbage'] as const) {
+      if (raw === undefined) delete process.env.RAIN_API_AUTH;
+      else process.env.RAIN_API_AUTH = raw;
+      let reads = 0;
+      __test_setSupabase({
+        auth: {
+          getUser: async () => {
+            reads += 1;
+            throw new Error('should not be called');
+          },
+        },
+        from() {
+          reads += 1;
           throw new Error('should not be called');
         },
-      },
-      from() {
-        throw new Error('should not be called');
-      },
-      rpc: async () => {
-        throw new Error('should not be called');
-      },
-    } as never);
-    const warn = captureWarn();
-    try {
-      const m = mockRes();
-      await handler(req({ lat: '38.46', lon: '-93.53', asOf: '2026-03-17T14:37:00Z' }), m.res);
-      assert.equal(m.status, 200);
-      assert.equal(authCalls, 0);
-      assert.equal(warn.denials().length, 0);
-    } finally {
-      warn.restore();
+        rpc: async () => {
+          reads += 1;
+          return { data: [{ total_inches: 9 }], error: null };
+        },
+      } as never);
+      const warn = captureWarn();
+      try {
+        const m = mockRes();
+        await handler(
+          req({ field_id: FIELD, start_date: '2026-03-01', end_date: '2026-03-17' }),
+          m.res
+        );
+        assert.equal(m.status, 401);
+        assert.deepEqual(m.json, { error: 'Sign in required' });
+        assert.equal(reads, 0);
+        assert.equal(warn.denials()[0]?.reason, 'no_token');
+        assert.equal(warn.denials()[0]?.mode, 'enforce');
+      } finally {
+        warn.restore();
+      }
     }
   });
 
-  it('log: serves a would-be denial and logs it without the token', async () => {
+  it('log: rejects a would-be denial and logs it without the token', async () => {
     process.env.RAIN_API_AUTH = 'log';
     __test_setSupabase(fakeSupabase({ allowed: false }) as never);
     const warn = captureWarn();
@@ -419,8 +432,8 @@ describe('rain handler auth modes', () => {
         req({ lat: '38.46', lon: '-93.53', field_id: FIELD, asOf: '2026-03-17T14:37:00Z' }, TOKEN),
         m.res
       );
-      assert.equal(m.status, 200);
-      assert.equal(typeof (m.json.rain as Record<string, number>)['24h'], 'number');
+      assert.equal(m.status, 403);
+      assert.deepEqual(m.json, { error: 'premium_required:rainfall' });
       const denial = warn.denials()[0];
       assert.equal(denial?.mode, 'log');
       assert.equal(denial?.reason, 'premium_required');
@@ -432,16 +445,25 @@ describe('rain handler auth modes', () => {
     }
   });
 
-  it('enforce: 401 without a token', async () => {
+  it('enforce: 401 without a token or with an invalid token', async () => {
     process.env.RAIN_API_AUTH = 'enforce';
     __test_setSupabase(fakeSupabase({ allowed: true }) as never);
-    const m = mockRes();
+    let m = mockRes();
     await handler(
       req({ lat: '38.46', lon: '-93.53', field_id: FIELD, asOf: '2026-03-17T14:37:00Z' }),
       m.res
     );
     assert.equal(m.status, 401);
     assert.deepEqual(m.json, { error: 'Sign in required' });
+
+    __test_setSupabase(fakeSupabase({ user: null, userError: { status: 401 } }) as never);
+    m = mockRes();
+    await handler(
+      req({ lat: '38.46', lon: '-93.53', field_id: FIELD, asOf: '2026-03-17T14:37:00Z' }, TOKEN),
+      m.res
+    );
+    assert.equal(m.status, 401);
+    assert.equal(m.json.rain, undefined);
   });
 
   it('enforce: serves coordinate-only and polygon-only requests for a paid farm', async () => {
