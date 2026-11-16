@@ -15,7 +15,9 @@ The Rain API is a Vercel serverless function that provides rainfall totals (12h,
 
 When both coordinate and `field_id` inputs are provided, results are merged (MAX of both sources).
 
-> **Recommended for new integrations:** Use **coordinate mode** (`lat`/`lon`). It queries IEM Stage IV directly and is not dependent on the Supabase ingestion pipeline being up to date.
+> **Sign-in is required on every mode**, including coordinate-only, polygon, custom date ranges, and stored field totals. Send `Authorization: Bearer <Supabase access token>`. The Rain API project must have `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY`. If either is missing, the response is `503` and no rainfall is returned.
+>
+> **Recommended for new integrations:** Use **coordinate mode** (`lat`/`lon`) when you do not have a saved field. It still requires the bearer token. Radar totals come from IEM Stage IV and do not depend on the rainfall ingestion pipeline being up to date.
 
 ## Core Components
 
@@ -222,10 +224,9 @@ For polygon requests, `location` uses `centroidLat`/`centroidLon` instead of `la
 | Code | Condition | Body |
 |------|-----------|------|
 | `400` | Invalid or missing input: bad `lat`/`lon`, `field_id` not a UUID, bad `tz`/`asOf`/dates, repeated query params, invalid polygon, malformed JSON body, no location given | `{ "error": "...", "detail": "..." }` |
-| `400` | `RAIN_API_AUTH=enforce` and no `field_id` on the request | `{ "error": "field_id required" }` |
-| `401` | `RAIN_API_AUTH=enforce` and no valid Supabase bearer token | `{ "error": "Sign in required" }` |
-| `403` | `RAIN_API_AUTH=enforce` and the field is missing, deleted, or on another farm (`Field not found for this farm`), the request point is more than 10 km from the field (`Coordinates do not match this field`), or the farm lacks the rainfall entitlement (`premium_required:rainfall`) | `{ "error": "..." }` |
-| `503` | `RAIN_API_AUTH=enforce` and the access check could not run (Supabase unavailable). Fails closed | `{ "error": "Rainfall access check unavailable" }` |
+| `401` | No `Authorization: Bearer` token, or the token is rejected | `{ "error": "Sign in required" }` |
+| `403` | The field is missing, deleted, or on another farm (`Field not found for this farm`), the request point is more than 10 km from the field (`Coordinates do not match this field`), the caller has no farm, or the farm lacks the rainfall entitlement (`premium_required:rainfall`) | `{ "error": "..." }` |
+| `503` | The access check could not run (Supabase client missing, `getUser` transport/5xx, or a lookup/RPC error). Fails closed. Also returned when `SUPABASE_URL` or `SUPABASE_SERVICE_ROLE_KEY` is unset | `{ "error": "Rainfall access check unavailable" }` |
 | `405` | Method other than GET, POST, OPTIONS | `{ "error": "Method Not Allowed" }` |
 | `502` | No usable data: radar timeout/failure, non-CONUS location (no radar data), or radar and database both unavailable | `{ "error": "Upstream data unavailable", "detail": "...", "retryAfterSeconds": 60 }` |
 | `500` | Unhandled error | `{ "error": "Internal Server Error" }` |
@@ -237,19 +238,18 @@ For polygon requests, `location` uses `centroidLat`/`centroidLon` instead of `la
 ## Technical Integration Notes
 
 ### 1. Networking
-CORS headers (`Access-Control-Allow-Origin: *`) are set on all responses — safe to call directly from a browser with `fetch` or `axios`. No API key required.
+CORS headers (`Access-Control-Allow-Origin: *`, `Access-Control-Allow-Headers: Content-Type, Authorization`) are set on all responses — safe to call directly from a browser with `fetch` or `axios`. Send the Supabase user access token in `Authorization`. There is no anonymous keyless data path.
 
 ### 2. Caching Strategy
-- Coordinate/polygon requests: `Cache-Control: s-maxage=300, stale-while-revalidate=60` (5 minutes at the CDN).
-- Field ID requests and custom date ranges: `private, no-store`.
-- When `RAIN_API_AUTH=enforce`, every successful response is `private, no-store` with `Vary: Authorization`.
+- Every data response is `Cache-Control: private, no-store` and `Vary: Authorization`.
+- Do not cache rainfall responses in a shared CDN. The body depends on who is signed in.
 
 ### 3. Deployment
 Configured for **Vercel** serverless (Hobby: 10-second function limit; radar uses an 8s timeout and radar/database are queried concurrently). Environment variables:
-- `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` — field ID mode and the auth gate. The handler reads the service-role key (not the anon key).
-- `RAIN_API_AUTH` — optional: `off` (default), `log`, or `enforce`. See the README "Access gate" section. The gate relies on the database function `rainfall_field_hourly_allowed` (apply the AcreLedger migration first); in `enforce`, if it is missing or errors, requests get `503` (fails closed).
+- `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` — required for every data request. The handler reads the service-role key (not the anon key). If either is missing, requests get `503` (fails closed).
+- `RAIN_API_AUTH` — optional. Unset, `off`, or any value other than `log` enforces sign-in. `log` uses the same rejection (the denial line's `mode` is `log`) and does not serve rainfall. See the README "Access gate" and "Deploy order" sections. The gate calls `rainfall_field_hourly_allowed` (apply the AcreLedger migration first); if it is missing or errors, requests get `503`.
 
-Coordinate and polygon modes require no environment variables — IEM is a public endpoint.
+IEM itself is a public endpoint. This API still requires the Supabase env vars because sign-in is checked before any radar or database rainfall read.
 
 ### 4. IEM Data Availability
 IEM Stage IV covers the contiguous US (CONUS) only. Locations without radar data return `502`. Data typically lags real-time by 1–2 hours, so the newest one or two hourly keys are often missing (not flagged unless more than 10% of a window is missing).
@@ -257,8 +257,8 @@ IEM Stage IV covers the contiguous US (CONUS) only. Locations without radar data
 ### 5. Hybrid Merge
 When both coordinate/polygon data and a `field_id` are provided, the API takes the MAX of IEM radar and Supabase values for each of the 24h/72h/168h windows (12h is radar only). This ensures maximum coverage if radar data is missing or if the Supabase ingestion pipeline experienced a lag. If the merged 7-day total exceeds the radar total by more than 0.05", a `dataWarning` is included.
 
-### 6. Access gate (`RAIN_API_AUTH`)
-When `enforce`, callers must send `Authorization: Bearer <Supabase access token>`. Field requests are also checked against the caller's farm and plan. See README for the rollout order (`log` first, then `enforce`).
+### 6. Access gate
+Callers must send `Authorization: Bearer <Supabase access token>` on every data route. Field requests are also checked against the caller's farm, soft-delete, coordinates, and plan. A GPS point or drawn boundary with no `field_id` still requires that JWT and a farm. There is no rollout mode that serves anonymous rainfall. See README "Deploy order" before shipping.
 
 ### 7. Local credentials note
 `.env.vercel` (a Vercel CLI development token, `VERCEL_OIDC_TOKEN`) was previously committed. It **expired 2026-03-28** and is now untracked and gitignored. Refresh with `vercel env pull` when needed; never commit `.env*` files.
@@ -274,4 +274,4 @@ IEM Stage IV may have a short processing delay (usually < 2 hours). Try again la
 The Supabase `field_rainfall_hourly` ingestion pipeline may have a gap. Cross-check with coordinate mode using the field's lat/lon — if coordinate mode returns rain, the pipeline missed that event and needs a backfill.
 
 ### 500 error on all requests
-Previously caused by missing `SUPABASE_URL` env var crashing the Supabase client at module load. Fixed: Supabase client is now lazily initialized only when `field_id` is provided.
+Previously caused by missing `SUPABASE_URL` crashing the Supabase client at module load. The client is created lazily. Auth now runs on every data request, so a missing `SUPABASE_URL` or `SUPABASE_SERVICE_ROLE_KEY` returns `503` `{ "error": "Rainfall access check unavailable" }` instead of rainfall.

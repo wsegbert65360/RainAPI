@@ -8,13 +8,13 @@ Rain API is a Vercel serverless function that provides rainfall totals for locat
 - **Coordinate mode** (`lat`/`lon`): Queries IEM Stage IV radar data directly (CONUS only, ~1-2hr lag)
 - **Field ID mode** (`field_id`): Queries AcreLedger Supabase via RPC `get_rainfall_stats`
 
-No API key is required. Coordinate mode works with zero environment variables.
+Every data route requires a Supabase user JWT. `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are required; if either is missing the handler returns 503 and does not serve rainfall.
 
 **Request methods**: GET for point lookups (`lat`/`lon` query params) and POST for polygon lookups (JSON body with coordinate array or GeoJSON polygon). Polygon requests compute the area-weighted centroid for IEM queries.
 
 **Response windows**: Always returns 12h, 24h, 72h (and 168h) accumulations in both inches (`rain`) and mm (`rainMm`). The period end is the last complete UTC hour (or `asOf` truncated to the hour). Optional `tz` parameter controls how lookback windows are calculated but IEM always uses UTC.
 
-**Error codes**: 400 (invalid input; with `enforce` also a missing `field_id`), 401/403/503 (only when `RAIN_API_AUTH=enforce`; 503 = access check unavailable, fails closed), 405, 502 (IEM timeout/failure or no radar data, e.g. non-CONUS, with `retryAfterSeconds`). There is no 404.
+**Error codes**: 400 (invalid input), 401 (missing or invalid Supabase bearer token), 403 (field ownership, soft-delete, coordinate match, or rainfall entitlement), 503 (access check unavailable, fails closed — including missing Supabase env), 405, 502 (IEM timeout/failure or no radar data, e.g. non-CONUS, with `retryAfterSeconds`). There is no 404. Sign-in is always required. `RAIN_API_AUTH` unset, `off`, or unknown means enforce. `log` denies as well.
 
 ## Commands
 
@@ -37,11 +37,11 @@ No linter or formatter is configured.
 - `iem.ts` — Fetches IEM Stage IV radar data with parallel date fetching, 8s timeout, retry with exponential backoff
 - `centroid.ts` — Polygon centroid calculation for field boundaries (area-weighted)
 - `validate.ts` — Query/body validation helpers (UUID, dates, timezone, polygon normalization)
-- `auth.ts` — Optional access gate controlled by `RAIN_API_AUTH` (off|log|enforce). `enforce` needs a bearer token, a `field_id` on the caller's farm, coordinates within 10 km of the field, and the rainfall entitlement; it fails closed (503) on infrastructure errors. Full rules in README "Access gate"
+- `auth.ts` — Access gate on every data route. Requires a bearer token, and either a `field_id` on the caller's farm (not soft-deleted, coordinates within 10 km, `rainfall_field_hourly_allowed`) or a signed-in location-only caller with a farm. Fails closed (503) on infrastructure errors. Unset `RAIN_API_AUTH` enforces. Full rules in README "Access gate"
 
 **Data flow**: Request → parse params → resolve lat/lon (direct or field lookup or centroid) → fetch IEM hourly data → aggregate into windows → return JSON
 
-**Caching**: Via `Cache-Control` headers — coordinate mode gets 5min CDN cache with stale-while-revalidate; field ID mode is `no-store`.
+**Caching**: Data responses are `Cache-Control: private, no-store` and `Vary: Authorization`.
 
 **Vercel Hobby constraint**: 10-second execution limit. IEM fetches use an 8-second hard timeout to return a clean 502 instead of a raw Vercel timeout. No persistent in-memory state between invocations (stateless).
 
@@ -57,13 +57,13 @@ No linter or formatter is configured.
 
 | Variable | Required | Used by |
 |----------|----------|---------|
-| `SUPABASE_URL` | Field ID mode / auth gate | Supabase client |
-| `SUPABASE_SERVICE_ROLE_KEY` | Field ID mode / auth gate | Supabase client (`api/rain.ts` reads this, not the anon key) |
-| `RAIN_API_AUTH` | No (default `off`) | `off`, `log` or `enforce` access gate |
+| `SUPABASE_URL` | Yes | Supabase client. Missing → 503, not an open API |
+| `SUPABASE_SERVICE_ROLE_KEY` | Yes | Supabase client (`api/rain.ts` reads this, not the anon key). Missing → 503 |
+| `RAIN_API_AUTH` | No | Unset, `off`, or unknown enforces sign-in. `log` logs the denial and still rejects |
 
 ## Deployment
 
-Push to `main` → automatic Vercel deployment. Ensure `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are set in Vercel project settings.
+Push to `main` → automatic Vercel deployment. `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` must already be set. Confirm the shipped iPhone build sends the bearer token before deploy (see README "Deploy order"). Do not treat unset `RAIN_API_AUTH` as off.
 
 ## TypeScript
 

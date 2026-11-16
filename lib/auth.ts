@@ -1,20 +1,24 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
 
-// Rain API access gate for the AcreLedger free tier.
+// Rain API access gate. Sign-in is required on every data route. There is no skip path.
 //
-//   RAIN_API_AUTH=off      (default) no check; today's behavior, old app builds keep working.
-//   RAIN_API_AUTH=log      run the check, log would-be denials as JSON, serve the request anyway.
-//   RAIN_API_AUTH=enforce  apply the decision. Fail closed: a Supabase or lookup failure is a 503,
-//                          never a served rainfall total.
+//   RAIN_API_AUTH unset, empty, "off", "enforce", or any unknown value
+//       apply the decision. This is the only safe default.
+//   RAIN_API_AUTH=log
+//       same decision and the same rejection. The denial log's mode field is "log".
+//       It does not serve the request.
 //
-// Enforce requires a Supabase bearer token and one of:
+// Fail closed: a missing Supabase client, a getUser transport/5xx error, or a lookup/RPC
+// failure is a 503, never a served rainfall total.
+//
+// A successful allow requires a Supabase user JWT and one of:
 //   * a field_id that belongs to the caller's farm and is not soft-deleted, request coordinates within
 //     FIELD_MATCH_RADIUS_KM of the field's stored lat/lng (or the stored point when the request has none),
 //     and rainfall_field_hourly_allowed(p_field_id); or
 //   * no field_id (a GPS point or a drawn boundary): a farm for the caller that is not on the free plan.
-// Do not log tokens or secrets. The handler logs only the denial reason.
+// Do not log tokens or secrets. The handler logs only the denial reason, status, and field id.
 
-export type RainAuthMode = 'off' | 'log' | 'enforce';
+export type RainAuthMode = 'log' | 'enforce';
 
 export type RainAuthDecision =
   | { allow: true; reason?: string; fieldLat?: number; fieldLng?: number }
@@ -37,7 +41,8 @@ interface FieldAccessRow {
 
 export function readRainAuthMode(raw: string | undefined = process.env.RAIN_API_AUTH): RainAuthMode {
   const value = (raw ?? '').trim().toLowerCase();
-  return value === 'log' || value === 'enforce' ? value : 'off';
+  // "log" still denies. Anything else, including unset and "off", enforces.
+  return value === 'log' ? 'log' : 'enforce';
 }
 
 export function readBearerToken(header: unknown): string | null {

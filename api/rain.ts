@@ -59,17 +59,10 @@ function methodNotAllowed(res: VercelResponse) {
   return res.status(405).json({ error: 'Method Not Allowed' });
 }
 
-function setCacheControl(
-  res: VercelResponse,
-  options: { fieldId?: string; customRange?: boolean; authRequired?: boolean }
-) {
-  // When login is enforced, a shared CDN cache would hand authenticated responses to anonymous callers.
-  if (options.fieldId || options.customRange || options.authRequired) {
-    res.setHeader('Vary', 'Authorization');
-    res.setHeader('Cache-Control', 'private, no-store');
-  } else {
-    res.setHeader('Cache-Control', 's-maxage=300, stale-while-revalidate=60');
-  }
+function setCacheControl(res: VercelResponse) {
+  // Every data response is for a signed-in caller. A shared cache must not store it.
+  res.setHeader('Vary', 'Authorization');
+  res.setHeader('Cache-Control', 'private, no-store');
 }
 
 function inchesToMmMap(values: Record<string, number>) {
@@ -230,38 +223,37 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       }
     }
 
+    // Sign-in is required on every data route, including stored totals and custom ranges.
+    // Unset, "off", and unknown RAIN_API_AUTH values enforce. "log" records the denial and still rejects.
     const authMode = readRainAuthMode();
-    if (authMode !== 'off') {
-      const decision = await decideRainAccess({
-        supabase: getSupabase(),
-        authorization: req.headers?.authorization,
-        fieldId,
-        lat,
-        lon,
-      });
-      if (!decision.allow) {
-        // Reason and field id only. Never include the bearer token or other secrets.
-        console.warn(JSON.stringify({
-          event: 'rain_auth_denied',
-          mode: authMode,
-          reason: decision.reason,
-          status: decision.status,
-          fieldId: fieldId ?? null,
-        }));
-        if (authMode === 'enforce') {
-          return res.status(decision.status).json({ error: decision.error });
-        }
-      } else if (
-        authMode === 'enforce' &&
-        lat === undefined &&
-        lon === undefined &&
-        decision.fieldLat !== undefined &&
-        decision.fieldLng !== undefined
-      ) {
-        // Custom range (and any other field_id request) with no point uses the stored field location.
-        lat = decision.fieldLat;
-        lon = decision.fieldLng;
-      }
+    const decision = await decideRainAccess({
+      supabase: getSupabase(),
+      authorization: req.headers?.authorization,
+      fieldId,
+      lat,
+      lon,
+    });
+    if (!decision.allow) {
+      // Reason, status, and field id only. Never include the bearer token or other secrets.
+      console.warn(JSON.stringify({
+        event: 'rain_auth_denied',
+        mode: authMode,
+        reason: decision.reason,
+        status: decision.status,
+        fieldId: fieldId ?? null,
+      }));
+      setCacheControl(res);
+      return res.status(decision.status).json({ error: decision.error });
+    }
+    if (
+      lat === undefined &&
+      lon === undefined &&
+      decision.fieldLat !== undefined &&
+      decision.fieldLng !== undefined
+    ) {
+      // Custom range (and any other field_id request) with no point uses the stored field location.
+      lat = decision.fieldLat;
+      lon = decision.fieldLng;
     }
 
     const tzParam = readSingleQueryParam(req.query as Record<string, unknown>, 'tz');
@@ -392,7 +384,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         warnings.push('Radar data was unavailable; using historical database totals.');
       }
 
-      setCacheControl(res, { fieldId, customRange: true, authRequired: authMode === 'enforce' });
+      setCacheControl(res);
       return res.status(200).json({
         location: {
           type,
@@ -550,7 +542,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       );
     }
 
-    setCacheControl(res, { fieldId, authRequired: authMode === 'enforce' });
+    setCacheControl(res);
 
     return res.status(200).json({
       location: {
